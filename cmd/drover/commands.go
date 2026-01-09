@@ -389,9 +389,7 @@ func statusCmd() *cobra.Command {
 			defer store.Close()
 
 			if watchMode {
-				// TODO: Implement watch mode
-				fmt.Println("Watch mode not yet implemented")
-				return nil
+				return runWatchMode(store)
 			}
 
 			status, err := store.GetProjectStatus()
@@ -617,6 +615,75 @@ func droverStatusToBeads(status types.TaskStatus) string {
 	default:
 		return "open"
 	}
+}
+
+// runWatchMode continuously updates the status display
+func runWatchMode(store *db.Store) error {
+	// Clear screen on start
+	fmt.Print("\033[H\033[2J")
+
+	// Set up signal handling for graceful exit
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// Create a ticker for regular updates
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var lastStatus *db.ProjectStatus
+
+	for {
+		select {
+		case <-sigChan:
+			// User pressed Ctrl+C
+			fmt.Println("\n\n👋 Watch mode stopped")
+			return nil
+
+		case <-ticker.C:
+			// Get fresh status
+			status, err := store.GetProjectStatus()
+			if err != nil {
+				fmt.Printf("\nError getting status: %v\n", err)
+				return err
+			}
+
+			// Only update if something changed
+			if lastStatus == nil || statusChanged(lastStatus, status) {
+				// Clear screen and move cursor to top-left
+				fmt.Print("\033[H\033[2J")
+
+				// Print header with timestamp
+				fmt.Printf("🐂 Drover Status (watch mode - %s)\n", time.Now().Format("15:04:05"))
+				fmt.Println("════════════════════════════════════════")
+				fmt.Printf("\nTotal:      %d\n", status.Total)
+				fmt.Printf("Ready:      %d\n", status.Ready)
+				fmt.Printf("In Progress: %d\n", status.InProgress)
+				fmt.Printf("Completed:  %d\n", status.Completed)
+				fmt.Printf("Failed:     %d\n", status.Failed)
+				fmt.Printf("Blocked:    %d\n", status.Blocked)
+
+				if status.Total > 0 {
+					progress := float64(status.Completed) / float64(status.Total) * 100
+					fmt.Printf("\nProgress: %.1f%%\n", progress)
+					printProgressBar(progress)
+				}
+
+				fmt.Println("\nPress Ctrl+C to exit")
+
+				lastStatus = status
+			}
+		}
+	}
+}
+
+// statusChanged checks if the status has changed since last update
+func statusChanged(old, new *db.ProjectStatus) bool {
+	return old.Total != new.Total ||
+		old.Ready != new.Ready ||
+		old.InProgress != new.InProgress ||
+		old.Completed != new.Completed ||
+		old.Failed != new.Failed ||
+		old.Blocked != new.Blocked
 }
 
 func printStatus(status *db.ProjectStatus) {
