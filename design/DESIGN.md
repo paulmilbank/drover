@@ -339,7 +339,7 @@ CREATE TABLE epics (
     title TEXT NOT NULL,
     description TEXT,
     status TEXT DEFAULT 'open',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at INTEGER NOT NULL
 );
 
 -- Tasks are the unit of work
@@ -347,24 +347,50 @@ CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     description TEXT,
-    epic_id TEXT REFERENCES epics(id),
+    epic_id TEXT,
+    parent_id TEXT,                    -- For hierarchical sub-tasks
+    sequence_number INTEGER DEFAULT 0, -- For ordering within parent
     priority INT DEFAULT 0,
     status TEXT DEFAULT 'ready',
     attempts INT DEFAULT 0,
     max_attempts INT DEFAULT 3,
     last_error TEXT,
-    assigned_worker TEXT,
-    claimed_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    claimed_by TEXT,                   -- Worker that claimed this task
+    claimed_at INTEGER,                -- Unix timestamp
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (epic_id) REFERENCES epics(id),
+    FOREIGN KEY (parent_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
 -- Dependencies define blocked-by relationships
 CREATE TABLE task_dependencies (
-    task_id TEXT REFERENCES tasks(id),
-    blocked_by TEXT REFERENCES tasks(id),
-    PRIMARY KEY (task_id, blocked_by)
+    task_id TEXT NOT NULL,
+    blocked_by TEXT NOT NULL,
+    PRIMARY KEY (task_id, blocked_by),
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY (blocked_by) REFERENCES tasks(id) ON DELETE CASCADE
 );
+
+-- Worktrees track git worktree lifecycle for cleanup
+CREATE TABLE worktrees (
+    task_id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL,
+    status TEXT DEFAULT 'active',
+    disk_size INTEGER DEFAULT 0,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+-- Indexes for common queries
+CREATE INDEX idx_tasks_status ON tasks(status);
+CREATE INDEX idx_tasks_epic ON tasks(epic_id);
+CREATE INDEX idx_tasks_parent ON tasks(parent_id);
+CREATE INDEX idx_tasks_parent_seq ON tasks(parent_id, sequence_number);
+CREATE INDEX idx_dependencies_blocked_by ON task_dependencies(blocked_by);
+CREATE INDEX idx_worktrees_status ON worktrees(status);
 
 -- DBOS manages its own tables for workflow state
 -- dbos_workflow_status, dbos_workflow_inputs, etc.
@@ -496,6 +522,53 @@ Claude Code executes arbitrary code. Drover does not sandbox this execution. Use
 3. Claude Code dependency
 4. No real-time collaboration between agents
 5. Limited conflict resolution (fail-fast on merge conflicts)
+
+---
+
+## Influences & Acknowledgments
+
+Drover incorporates ideas and concepts from several innovative projects:
+
+### Beads
+
+**[Beads](https://github.com/beads-dev/beads)** heavily influenced Drover's task hierarchy design:
+
+- **Hierarchical Task IDs** — Beads' `task-id.subtask` format inspired Drover's `task-123.1` syntax
+- **Sub-task decomposition** — Breaking complex work into sequential, ordered pieces
+- **Flat storage with hierarchy** — Hierarchical structure without nested complexity
+
+Drover's sub-task system directly implements these patterns while adding durable workflow orchestration.
+
+### Geoffrey Huntley's Ralph Wiggum
+
+**[Geoffrey Huntley](https://github.com/gdhuntley)** articulated the "Ralph Wiggum" pattern:
+
+- Delegating repetitive, well-defined tasks to AI agents
+- Human provides direction and oversight
+- Agents execute routine work at scale
+- Focus on completion over perfection
+
+This philosophy is central to Drover's design: break down projects, queue the work, and let agents drive it to completion.
+
+### DBOS
+
+**[DBOS](https://dbos.dev/)** provides the foundational workflow engine:
+
+- Durable execution with automatic crash recovery
+- Exactly-once semantics via checkpointing
+- Built-in queues with concurrency control
+- SQLite support for zero-config development
+
+The [DBOS Go SDK](https://github.com/dbos-inc/dbos-transact-golang) makes these capabilities accessible to Go applications.
+
+### Claude Code
+
+**[Anthropic's Claude Code](https://claude.ai/code)** is the AI execution layer:
+
+- Advanced code understanding and generation
+- Tool use for file operations, testing, and more
+- Stateful conversation context for complex tasks
+- Human-in-the-loop oversight when needed
 
 ---
 

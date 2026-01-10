@@ -89,6 +89,8 @@ go install github.com/cloud-shuttle/drover@latest
 | `drover status --watch` | Live progress updates |
 | `drover status --tree` | Show hierarchical task tree |
 | `drover resume` | Resume interrupted workflows |
+| `drover worktree prune` | Clean up completed task worktrees |
+| `drover worktree prune -a` | Clean up all worktrees (incl. build artifacts) |
 
 ## Configuration
 
@@ -377,6 +379,20 @@ go test -race ./...
 ## License
 
 MIT — see [LICENSE](./LICENSE)
+
+## Acknowledgments
+
+Drover stands on the shoulders of giants. We're grateful to:
+
+- **[DBOS](https://dbos.dev/)** — The durable workflow engine that powers Drover's crash recovery and exactly-once execution. The [DBOS Go SDK](https://github.com/dbos-inc/dbos-transact-golang) makes durable workflows accessible in Go.
+
+- **[Beads](https://github.com/beads-dev/beads)** — Inspired the hierarchical task ID format (`task-123.1`, `task-123.1.2`). Beads' approach to breaking down complex work into manageable pieces heavily influenced Drover's sub-task system.
+
+- **[Geoffrey Huntley](https://github.com/gdhuntley)** — The "Ralph Wiggum" concept (using AI agents to handle repetitive, well-defined tasks) inspired Drover's core philosophy: let agents handle the routine work while humans provide direction.
+
+- **[Anthropic](https://www.anthropic.com/)** — Claude Code is the AI agent that powers Drover's task execution. Thanks for building an incredible AI coding assistant.
+
+- **[Cloud Shuttle](https://cloudshuttle.com.au)** — Built and maintains Drover.
 
 ---
 
