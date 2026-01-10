@@ -20,6 +20,7 @@ import (
 	"github.com/cloud-shuttle/drover/internal/db"
 	"github.com/cloud-shuttle/drover/internal/executor"
 	"github.com/cloud-shuttle/drover/internal/git"
+	"github.com/cloud-shuttle/drover/pkg/telemetry"
 	"github.com/cloud-shuttle/drover/pkg/types"
 )
 
@@ -74,6 +75,10 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	if o.epicID != "" {
 		log.Printf("🎯 Filtering to epic: %s", o.epicID)
 	}
+
+	// Start workflow span for telemetry
+	_, workflowSpan := telemetry.StartWorkflowSpan(ctx, telemetry.SpanWorkflowRun, "")
+	defer workflowSpan.End()
 
 	// Start workers - they will claim tasks independently
 	var wg sync.WaitGroup
@@ -159,6 +164,15 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 
 	log.Printf("👷 Worker %d executing task %s: %s", workerID, task.ID, task.Title)
 
+	// Start telemetry span for task execution
+	taskCtx, taskSpan := telemetry.StartTaskSpan(context.Background(),
+		telemetry.SpanTaskExecute,
+		telemetry.TaskAttrs(task.ID, task.Title, "in_progress", task.Priority, task.Attempts)...)
+
+	workerIDStr := fmt.Sprintf("worker-%d", workerID)
+	telemetry.RecordTaskClaimed(taskCtx, workerIDStr, o.epicID)
+	defer taskSpan.End()
+
 	// Update to in_progress
 	if err := o.store.UpdateTaskStatus(task.ID, types.TaskStatusInProgress, ""); err != nil {
 		log.Printf("Error updating task status: %v", err)
@@ -181,6 +195,8 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 	worktreePath, err := o.git.Create(task)
 	if err != nil {
 		log.Printf("❌ Task %s failed: creating worktree: %v", task.ID, err)
+		telemetry.RecordError(taskSpan, err, "WorktreeCreationFailed", "git")
+		telemetry.SetTaskStatus(taskSpan, "failed")
 		if o.handleTaskFailure(task.ID, err.Error()) {
 			taskCompleted = true // Task set to ready for retry
 		}
@@ -189,9 +205,11 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 	defer o.git.Remove(task.ID)
 
 	// Execute Claude Code and capture the result
-	result := o.executor.ExecuteWithTimeout(context.Background(), worktreePath, task)
+	result := o.executor.ExecuteWithTimeout(taskCtx, worktreePath, task, taskSpan)
 	if !result.Success {
 		log.Printf("❌ Task %s failed: claude execution: %v", task.ID, result.Error)
+		telemetry.RecordError(taskSpan, result.Error, "AgentExecutionFailed", "agent")
+		telemetry.SetTaskStatus(taskSpan, "failed")
 		if o.handleTaskFailure(task.ID, result.Error.Error()) {
 			taskCompleted = true // Task set to ready for retry
 		}
@@ -206,6 +224,8 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 	hasChanges, err := o.git.Commit(task.ID, commitMsg)
 	if err != nil {
 		log.Printf("❌ Task %s failed: committing: %v", task.ID, err)
+		telemetry.RecordError(taskSpan, err, "CommitFailed", "git")
+		telemetry.SetTaskStatus(taskSpan, "failed")
 		if o.handleTaskFailure(task.ID, err.Error()) {
 			taskCompleted = true // Task set to ready for retry
 		}
@@ -229,6 +249,7 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 	if err := o.git.MergeToMain(task.ID); err != nil {
 		// Log merge error but continue - task completed successfully even if merge failed
 		log.Printf("⚠️  Task %s completed but merge failed: %v", task.ID, err)
+		telemetry.RecordError(taskSpan, err, "MergeFailed", "git")
 		// Don't return here - continue to mark task as complete
 	}
 
@@ -240,6 +261,10 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 	taskCompleted = true
 	duration := time.Since(start)
 	log.Printf("✅ Worker %d completed task %s in %v", workerID, task.ID, duration)
+
+	// Record task completion telemetry
+	telemetry.SetTaskStatus(taskSpan, "completed")
+	telemetry.RecordTaskCompleted(taskCtx, workerIDStr, o.epicID, duration)
 }
 
 // handleTaskFailure increments attempts and either retries or marks as failed
