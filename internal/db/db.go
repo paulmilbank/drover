@@ -298,12 +298,106 @@ func (s *Store) CreateSubTask(title, description, parentID string, priority int,
 	}
 	defer tx.Rollback()
 
+	// Convert empty epic_id to NULL for foreign key constraint
+	var epicIDValue interface{} = task.EpicID
+	if epicIDValue == "" {
+		epicIDValue = nil
+	}
+
 	// Insert task
 	_, err = tx.Exec(`
 		INSERT INTO tasks (id, title, description, epic_id, parent_id, sequence_number,
 		                  priority, status, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, task.ID, task.Title, task.Description, task.EpicID, task.ParentID, task.SequenceNumber,
+	`, task.ID, task.Title, task.Description, epicIDValue, task.ParentID, task.SequenceNumber,
+		task.Priority, task.Status, task.CreatedAt, task.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("creating sub-task: %w", err)
+	}
+
+	// Insert dependencies
+	for _, blockerID := range blockedBy {
+		_, err = tx.Exec(`
+			INSERT INTO task_dependencies (task_id, blocked_by)
+			VALUES (?, ?)
+		`, task.ID, blockerID)
+		if err != nil {
+			return nil, fmt.Errorf("adding dependency: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("committing transaction: %w", err)
+	}
+
+	return task, nil
+}
+
+// CreateSubTaskWithSequence creates a new sub-task with a specific hierarchical ID
+// This is used when the user specifies a sequence number via CLI syntax (e.g., task-123.5)
+func (s *Store) CreateSubTaskWithSequence(title, description, parentID string, sequence int, priority int, blockedBy []string) (*types.Task, error) {
+	// Verify parent exists and is not itself a sub-task (max 2 levels)
+	parent, err := s.GetTask(parentID)
+	if err != nil {
+		return nil, fmt.Errorf("parent task not found: %w", err)
+	}
+	if parent.ParentID != "" {
+		return nil, fmt.Errorf("parent task is already a sub-task (max depth is 2 levels)")
+	}
+
+	// Check if the specified sequence number is already taken
+	var existingCount int
+	err = s.DB.QueryRow(`
+		SELECT COUNT(*) FROM tasks WHERE parent_id = ? AND sequence_number = ?
+	`, parentID, sequence).Scan(&existingCount)
+	if err != nil {
+		return nil, fmt.Errorf("checking existing sequence: %w", err)
+	}
+	if existingCount > 0 {
+		return nil, fmt.Errorf("sequence number %d already exists for parent %s", sequence, parentID)
+	}
+
+	// Generate hierarchical ID: parentID.sequence
+	id := fmt.Sprintf("%s.%d", parentID, sequence)
+	now := time.Now().Unix()
+
+	task := &types.Task{
+		ID:             id,
+		Title:          title,
+		Description:    description,
+		EpicID:         parent.EpicID,
+		ParentID:       parentID,
+		SequenceNumber: sequence,
+		Priority:       priority,
+		Status:         types.TaskStatusReady,
+		MaxAttempts:    3,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+
+	// Check if task should start as blocked
+	if len(blockedBy) > 0 {
+		task.Status = types.TaskStatusBlocked
+	}
+
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("beginning transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Convert empty epic_id to NULL for foreign key constraint
+	var epicIDValue interface{} = task.EpicID
+	if epicIDValue == "" {
+		epicIDValue = nil
+	}
+
+	// Insert task
+	_, err = tx.Exec(`
+		INSERT INTO tasks (id, title, description, epic_id, parent_id, sequence_number,
+		                  priority, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, task.ID, task.Title, task.Description, epicIDValue, task.ParentID, task.SequenceNumber,
 		task.Priority, task.Status, task.CreatedAt, task.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("creating sub-task: %w", err)

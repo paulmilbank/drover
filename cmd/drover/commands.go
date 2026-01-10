@@ -313,20 +313,35 @@ Maximum depth is 2 levels (Epic → Parent → Child).`,
 
 			// Auto-detect hierarchical ID syntax (e.g., "task-123.1 Title here")
 			if parentID == "" {
-				baseID, level1, level2, _ := db.ParseHierarchicalID(title)
-				if baseID != "" && (level1 > 0 || level2 > 0) {
-					// Extract the parent ID and actual title
-					if level2 > 0 {
-						// task-123.1.2 -> parent is task-123.1
-						parentID = fmt.Sprintf("%s.%d", baseID, level1)
-					} else if level1 > 0 {
-						// task-123.1 -> parent is task-123
-						parentID = baseID
-					}
-					// Extract the actual title (after the hierarchical ID)
-					parts := db.ExtractBaseID(title)
-					if parts != title {
-						title = strings.TrimSpace(strings.TrimPrefix(title, parts+" "))
+				// First, try to extract a hierarchical ID prefix from the title
+				// The pattern is: prefix-number(.number(.number)?) followed by space and title
+				// We need to find the longest matching prefix
+				words := strings.Fields(title)
+				if len(words) > 0 {
+					firstWord := words[0]
+					baseID, level1, level2, _ := db.ParseHierarchicalID(firstWord)
+					if baseID != "" && (level1 > 0 || level2 > 0) {
+						// Extract the parent ID, sequence number, and actual title
+						var sequence int
+						if level2 > 0 {
+							// task-123.1.2 -> parent is task-123.1, sequence is 2
+							parentID = fmt.Sprintf("%s.%d", baseID, level1)
+							sequence = level2
+						} else if level1 > 0 {
+							// task-123.1 -> parent is task-123, sequence is 1
+							parentID = baseID
+							sequence = level1
+						}
+						// Extract the actual title (after the hierarchical ID prefix)
+						title = strings.TrimSpace(strings.TrimPrefix(title, firstWord+" "))
+
+						// Use CreateSubTaskWithSequence when user specifies a sequence number
+						subTask, err := store.CreateSubTaskWithSequence(title, desc, parentID, sequence, priority, blockedBy)
+						if err != nil {
+							return err
+						}
+						fmt.Printf("✅ Created task %s\n", subTask.ID)
+						return nil
 					}
 				}
 			}
