@@ -160,6 +160,36 @@ func (s *Store) MigrateSchema() error {
 		}
 	}
 
+	// Check if worktrees table exists (added in a later version)
+	var worktreesTableExists bool
+	err = s.DB.QueryRow(`
+		SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='worktrees'
+	`).Scan(&worktreesTableExists)
+	if err != nil {
+		return fmt.Errorf("checking for worktrees table: %w", err)
+	}
+
+	if !worktreesTableExists {
+		// Create the worktrees table
+		_, err := s.DB.Exec(`
+			CREATE TABLE worktrees (
+				task_id TEXT PRIMARY KEY,
+				path TEXT NOT NULL,
+				branch TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				last_used_at INTEGER NOT NULL,
+				status TEXT DEFAULT 'active',
+				disk_size INTEGER DEFAULT 0,
+				FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+			);
+			CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
+			CREATE INDEX IF NOT EXISTS idx_worktrees_created ON worktrees(created_at);
+		`)
+		if err != nil {
+			return fmt.Errorf("creating worktrees table: %w", err)
+		}
+	}
+
 	return nil
 }
 

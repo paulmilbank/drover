@@ -100,5 +100,11 @@ func requireProject() (string, *db.Store, error) {
 		return "", nil, fmt.Errorf("opening database: %w", err)
 	}
 
+	// Run migrations to ensure database schema is up to date
+	if err := store.MigrateSchema(); err != nil {
+		store.Close()
+		return "", nil, fmt.Errorf("migrating database schema: %w", err)
+	}
+
 	return dir, store, nil
 }
