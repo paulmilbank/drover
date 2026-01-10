@@ -164,6 +164,22 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 
 	log.Printf("👷 Worker %d executing task %s: %s", workerID, task.ID, task.Title)
 
+	// Check if task has sub-tasks - execute them first
+	hasChildren, err := o.store.HasSubTasks(task.ID)
+	if err != nil {
+		log.Printf("Error checking for sub-tasks: %v", err)
+	}
+	if hasChildren {
+		log.Printf("📋 Task %s has sub-tasks, executing them first", task.ID)
+		if !o.executeSubTasks(workerID, task) {
+			// Sub-tasks failed, mark parent as failed
+			log.Printf("❌ Task %s failed due to sub-task failures", task.ID)
+			_ = o.store.UpdateTaskStatus(task.ID, types.TaskStatusFailed, "Sub-tasks failed")
+			taskCompleted = true
+			return
+		}
+	}
+
 	// Start telemetry span for task execution
 	taskCtx, taskSpan := telemetry.StartTaskSpan(context.Background(),
 		telemetry.SpanTaskExecute,
@@ -265,6 +281,102 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 	// Record task completion telemetry
 	telemetry.SetTaskStatus(taskSpan, "completed")
 	telemetry.RecordTaskCompleted(taskCtx, workerIDStr, o.epicID, duration)
+}
+
+// executeSubTasks executes all sub-tasks of a parent task
+// Returns true if all sub-tasks succeeded, false if any failed
+func (o *Orchestrator) executeSubTasks(workerID int, parentTask *types.Task) bool {
+	subTasks, err := o.store.GetSubTasks(parentTask.ID)
+	if err != nil {
+		log.Printf("Error getting sub-tasks: %v", err)
+		return false
+	}
+
+	if len(subTasks) == 0 {
+		return true
+	}
+
+	log.Printf("📋 Executing %d sub-tasks for %s", len(subTasks), parentTask.ID)
+
+	// Execute sub-tasks sequentially in order
+	for _, subTask := range subTasks {
+		log.Printf("📋 Executing sub-task %s: %s", subTask.ID, subTask.Title)
+
+		// Update sub-task status to in_progress
+		if err := o.store.UpdateTaskStatus(subTask.ID, types.TaskStatusInProgress, ""); err != nil {
+			log.Printf("Error updating sub-task status: %v", err)
+			continue
+		}
+
+		// Check if sub-task has its own sub-tasks (shouldn't happen with max depth 2)
+		hasChildren, _ := o.store.HasSubTasks(subTask.ID)
+		if hasChildren {
+			log.Printf("❌ Sub-task %s has children (max depth exceeded)", subTask.ID)
+			o.store.UpdateTaskStatus(subTask.ID, types.TaskStatusFailed, "Max depth exceeded")
+			return false
+		}
+
+		// Create worktree for sub-task
+		worktreePath, err := o.git.Create(subTask)
+		if err != nil {
+			log.Printf("❌ Sub-task %s failed: creating worktree: %v", subTask.ID, err)
+			o.handleTaskFailure(subTask.ID, err.Error())
+			return false
+		}
+
+		// Execute sub-task
+		start := time.Now()
+		taskCtx, taskSpan := telemetry.StartTaskSpan(context.Background(),
+			telemetry.SpanTaskExecute,
+			telemetry.TaskAttrs(subTask.ID, subTask.Title, "in_progress", subTask.Priority, subTask.Attempts)...)
+		telemetry.RecordTaskClaimed(taskCtx, fmt.Sprintf("worker-%d", workerID), parentTask.EpicID)
+		defer taskSpan.End()
+
+		result := o.executor.ExecuteWithTimeout(taskCtx, worktreePath, subTask, taskSpan)
+
+		// Clean up worktree
+		o.git.Remove(subTask.ID)
+
+		if !result.Success {
+			log.Printf("❌ Sub-task %s failed: %v", subTask.ID, result.Error)
+			telemetry.RecordError(taskSpan, result.Error, "AgentExecutionFailed", "agent")
+			telemetry.SetTaskStatus(taskSpan, "failed")
+			o.handleTaskFailure(subTask.ID, result.Error.Error())
+			return false
+		}
+
+		// Commit changes
+		commitMsg := fmt.Sprintf("drover: %s (sub-task of %s)\n\nTask: %s", subTask.ID, parentTask.ID, subTask.Title)
+		_, err = o.git.Commit(subTask.ID, commitMsg)
+		if err != nil {
+			log.Printf("❌ Sub-task %s failed: committing: %v", subTask.ID, err)
+			telemetry.RecordError(taskSpan, err, "CommitFailed", "git")
+			telemetry.SetTaskStatus(taskSpan, "failed")
+			o.handleTaskFailure(subTask.ID, err.Error())
+			return false
+		}
+
+		// Try to merge to main
+		if err := o.git.MergeToMain(subTask.ID); err != nil {
+			log.Printf("⚠️  Sub-task %s completed but merge failed: %v", subTask.ID, err)
+			telemetry.RecordError(taskSpan, err, "MergeFailed", "git")
+		}
+
+		// Mark sub-task complete
+		if err := o.store.CompleteTask(subTask.ID); err != nil {
+			log.Printf("Error completing sub-task: %v", err)
+		}
+
+		duration := time.Since(start)
+		log.Printf("✅ Completed sub-task %s in %v", subTask.ID, duration)
+
+		// Record sub-task completion telemetry
+		telemetry.SetTaskStatus(taskSpan, "completed")
+		telemetry.RecordTaskCompleted(taskCtx, fmt.Sprintf("worker-%d", workerID), parentTask.EpicID, duration)
+	}
+
+	log.Printf("✅ All %d sub-tasks completed for %s", len(subTasks), parentTask.ID)
+	return true
 }
 
 // handleTaskFailure increments attempts and either retries or marks as failed

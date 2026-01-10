@@ -120,15 +120,36 @@ func ImportFromBeads(config SyncConfig) ([]types.Epic, []types.Task, []types.Tas
 			var taskData BeadTask
 			json.Unmarshal(record.Data, &taskData)
 
+			// Extract parent_id from hierarchical ID (e.g., "task-123.1" -> parent="task-123")
+			parentID := ""
+			sequenceNumber := 0
+			if strings.Contains(record.ID, ".") {
+				parts := strings.Split(record.ID, ".")
+				if len(parts) >= 2 {
+					parentID = parts[0]
+					// Parse sequence number from the last part
+					seqStr := parts[len(parts)-1]
+					fmt.Sscanf(seqStr, "%d", &sequenceNumber)
+				}
+			}
+
+			// Validate depth - reject tasks deeper than 2 levels
+			if strings.Count(record.ID, ".") > 1 {
+				// Skip this task - exceeds max depth
+				continue
+			}
+
 			task := types.Task{
-				ID:          record.ID,
-				Title:       taskData.Title,
-				Description: taskData.Description,
-				EpicID:      taskData.EpicID,
-				Priority:    taskData.Priority,
-				Status:      beadsStatusToDrover(taskData.Status),
-				CreatedAt:   record.Timestamp.Unix(),
-				UpdatedAt:   time.Now().Unix(),
+				ID:             record.ID,
+				Title:          taskData.Title,
+				Description:    taskData.Description,
+				EpicID:         taskData.EpicID,
+				ParentID:       parentID,
+				SequenceNumber: sequenceNumber,
+				Priority:       taskData.Priority,
+				Status:         beadsStatusToDrover(taskData.Status),
+				CreatedAt:      record.Timestamp.Unix(),
+				UpdatedAt:      time.Now().Unix(),
 			}
 			tasks = append(tasks, task)
 			importedTasks[record.ID] = true

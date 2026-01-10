@@ -77,6 +77,8 @@ func (s *Store) InitSchema() error {
 		title TEXT NOT NULL,
 		description TEXT,
 		epic_id TEXT,
+		parent_id TEXT,
+		sequence_number INTEGER DEFAULT 0,
 		priority INTEGER DEFAULT 0,
 		status TEXT DEFAULT 'ready',
 		attempts INTEGER DEFAULT 0,
@@ -86,7 +88,8 @@ func (s *Store) InitSchema() error {
 		claimed_at INTEGER,
 		created_at INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL,
-		FOREIGN KEY (epic_id) REFERENCES epics(id)
+		FOREIGN KEY (epic_id) REFERENCES epics(id),
+		FOREIGN KEY (parent_id) REFERENCES tasks(id) ON DELETE CASCADE
 	);
 
 	-- Dependencies define blocked-by relationships
@@ -113,6 +116,8 @@ func (s *Store) InitSchema() error {
 	-- Indexes for common queries
 	CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 	CREATE INDEX IF NOT EXISTS idx_tasks_epic ON tasks(epic_id);
+	CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
+	CREATE INDEX IF NOT EXISTS idx_tasks_parent_seq ON tasks(parent_id, sequence_number);
 	CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority DESC);
 	CREATE INDEX IF NOT EXISTS idx_dependencies_blocked_by ON task_dependencies(blocked_by);
 	CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
@@ -121,6 +126,41 @@ func (s *Store) InitSchema() error {
 
 	_, err := s.DB.Exec(schema)
 	return err
+}
+
+// MigrateSchema runs database migrations for existing databases
+// This adds new columns that weren't in the original schema
+func (s *Store) MigrateSchema() error {
+	// Check if parent_id column exists
+	var parentIDExists bool
+	err := s.DB.QueryRow(`
+		SELECT COUNT(*) > 0 FROM pragma_table_info('tasks') WHERE name = 'parent_id'
+	`).Scan(&parentIDExists)
+	if err != nil {
+		return fmt.Errorf("checking for parent_id column: %w", err)
+	}
+
+	if !parentIDExists {
+		// Add parent_id and sequence_number columns for sub-task hierarchy
+		_, err := s.DB.Exec(`
+			ALTER TABLE tasks ADD COLUMN parent_id TEXT REFERENCES tasks(id) ON DELETE CASCADE;
+			ALTER TABLE tasks ADD COLUMN sequence_number INTEGER DEFAULT 0;
+		`)
+		if err != nil {
+			return fmt.Errorf("adding hierarchy columns: %w", err)
+		}
+
+		// Create indexes for the new columns
+		_, err = s.DB.Exec(`
+			CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
+			CREATE INDEX IF NOT EXISTS idx_tasks_parent_seq ON tasks(parent_id, sequence_number);
+		`)
+		if err != nil {
+			return fmt.Errorf("creating hierarchy indexes: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // CreateEpic creates a new epic
@@ -207,6 +247,86 @@ func (s *Store) CreateTask(title, description, epicID string, priority int, bloc
 	return task, nil
 }
 
+// CreateSubTask creates a new sub-task with a hierarchical ID
+func (s *Store) CreateSubTask(title, description, parentID string, priority int, blockedBy []string) (*types.Task, error) {
+	// Verify parent exists and is not itself a sub-task (max 2 levels)
+	parent, err := s.GetTask(parentID)
+	if err != nil {
+		return nil, fmt.Errorf("parent task not found: %w", err)
+	}
+	if parent.ParentID != "" {
+		return nil, fmt.Errorf("parent task is already a sub-task (max depth is 2 levels)")
+	}
+
+	// Get the next sequence number for this parent
+	var nextSeq int
+	err = s.DB.QueryRow(`
+		SELECT COALESCE(MAX(sequence_number), 0) + 1
+		FROM tasks
+		WHERE parent_id = ?
+	`, parentID).Scan(&nextSeq)
+	if err != nil {
+		return nil, fmt.Errorf("getting next sequence number: %w", err)
+	}
+
+	// Generate hierarchical ID: parentID.sequence
+	id := fmt.Sprintf("%s.%d", parentID, nextSeq)
+	now := time.Now().Unix()
+
+	task := &types.Task{
+		ID:             id,
+		Title:          title,
+		Description:    description,
+		EpicID:         parent.EpicID,
+		ParentID:       parentID,
+		SequenceNumber: nextSeq,
+		Priority:       priority,
+		Status:         types.TaskStatusReady,
+		MaxAttempts:    3,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+
+	// Check if task should start as blocked
+	if len(blockedBy) > 0 {
+		task.Status = types.TaskStatusBlocked
+	}
+
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("beginning transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Insert task
+	_, err = tx.Exec(`
+		INSERT INTO tasks (id, title, description, epic_id, parent_id, sequence_number,
+		                  priority, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, task.ID, task.Title, task.Description, task.EpicID, task.ParentID, task.SequenceNumber,
+		task.Priority, task.Status, task.CreatedAt, task.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("creating sub-task: %w", err)
+	}
+
+	// Insert dependencies
+	for _, blockerID := range blockedBy {
+		_, err = tx.Exec(`
+			INSERT INTO task_dependencies (task_id, blocked_by)
+			VALUES (?, ?)
+		`, task.ID, blockerID)
+		if err != nil {
+			return nil, fmt.Errorf("adding dependency: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("committing transaction: %w", err)
+	}
+
+	return task, nil
+}
+
 // GetProjectStatus returns overall project status
 func (s *Store) GetProjectStatus() (*ProjectStatus, error) {
 	status := &ProjectStatus{}
@@ -273,7 +393,7 @@ func (s *Store) ClaimTaskForEpic(workerID, epicID string) (*types.Task, error) {
 	// Build the query with optional epic filtering
 	var task types.Task
 	if epicID != "" {
-		// Filter by epic_id
+		// Filter by epic_id and exclude sub-tasks (they run via parent)
 		err = tx.QueryRow(`
 			UPDATE tasks
 			SET status = 'claimed',
@@ -282,17 +402,19 @@ func (s *Store) ClaimTaskForEpic(workerID, epicID string) (*types.Task, error) {
 			    updated_at = ?
 			WHERE id = (
 				SELECT id FROM tasks
-				WHERE status = 'ready' AND epic_id = ?
+				WHERE status = 'ready' AND epic_id = ? AND parent_id IS NULL
 				ORDER BY priority DESC, created_at ASC
 				LIMIT 1
 			)
 			RETURNING id, title, COALESCE(description, ''), COALESCE(epic_id, ''),
+			          COALESCE(parent_id, ''), sequence_number,
 			          priority, status, attempts, max_attempts, created_at, updated_at
 		`, workerID, now, now, epicID).Scan(&task.ID, &task.Title, &task.Description, &task.EpicID,
+			&task.ParentID, &task.SequenceNumber,
 			&task.Priority, &task.Status, &task.Attempts, &task.MaxAttempts,
 			&task.CreatedAt, &task.UpdatedAt)
 	} else {
-		// No epic filtering
+		// No epic filtering, exclude sub-tasks (they run via parent)
 		err = tx.QueryRow(`
 			UPDATE tasks
 			SET status = 'claimed',
@@ -301,13 +423,15 @@ func (s *Store) ClaimTaskForEpic(workerID, epicID string) (*types.Task, error) {
 			    updated_at = ?
 			WHERE id = (
 				SELECT id FROM tasks
-				WHERE status = 'ready'
+				WHERE status = 'ready' AND parent_id IS NULL
 				ORDER BY priority DESC, created_at ASC
 				LIMIT 1
 			)
 			RETURNING id, title, COALESCE(description, ''), COALESCE(epic_id, ''),
+			          COALESCE(parent_id, ''), sequence_number,
 			          priority, status, attempts, max_attempts, created_at, updated_at
 		`, workerID, now, now).Scan(&task.ID, &task.Title, &task.Description, &task.EpicID,
+			&task.ParentID, &task.SequenceNumber,
 			&task.Priority, &task.Status, &task.Attempts, &task.MaxAttempts,
 			&task.CreatedAt, &task.UpdatedAt)
 	}
@@ -377,6 +501,7 @@ func (s *Store) GetTask(taskID string) (*types.Task, error) {
 
 	err := s.DB.QueryRow(`
 		SELECT id, title, COALESCE(description, ''), COALESCE(epic_id, ''),
+		       COALESCE(parent_id, ''), sequence_number,
 		       priority, status, attempts, max_attempts,
 		       COALESCE(claimed_by, ''), COALESCE(claimed_at, 0),
 		       created_at, updated_at
@@ -384,6 +509,7 @@ func (s *Store) GetTask(taskID string) (*types.Task, error) {
 		WHERE id = ?
 	`, taskID).Scan(
 		&task.ID, &task.Title, &description, &epicID,
+		&task.ParentID, &task.SequenceNumber,
 		&task.Priority, &task.Status, &task.Attempts, &task.MaxAttempts,
 		&claimedBy, &claimedAt,
 		&task.CreatedAt, &task.UpdatedAt,
@@ -530,6 +656,7 @@ func (s *Store) ListTasksByEpic(epicID string) ([]*types.Task, error) {
 		// Filter by epic ID
 		rows, err = s.DB.Query(`
 			SELECT id, title, COALESCE(description, ''), COALESCE(epic_id, ''),
+			       COALESCE(parent_id, ''), sequence_number,
 			       priority, status, attempts, max_attempts,
 			       COALESCE(claimed_by, ''), COALESCE(claimed_at, 0),
 			       created_at, updated_at
@@ -541,6 +668,7 @@ func (s *Store) ListTasksByEpic(epicID string) ([]*types.Task, error) {
 		// Return all tasks
 		rows, err = s.DB.Query(`
 			SELECT id, title, COALESCE(description, ''), COALESCE(epic_id, ''),
+			       COALESCE(parent_id, ''), sequence_number,
 			       priority, status, attempts, max_attempts,
 			       COALESCE(claimed_by, ''), COALESCE(claimed_at, 0),
 			       created_at, updated_at
@@ -561,9 +689,11 @@ func (s *Store) ListTasksByEpic(epicID string) ([]*types.Task, error) {
 		var claimedAt sql.NullInt64
 		var epicID sql.NullString
 		var description sql.NullString
+		var parentID sql.NullString
 
 		err := rows.Scan(
 			&task.ID, &task.Title, &description, &epicID,
+			&parentID, &task.SequenceNumber,
 			&task.Priority, &task.Status, &task.Attempts, &task.MaxAttempts,
 			&claimedBy, &claimedAt,
 			&task.CreatedAt, &task.UpdatedAt,
@@ -574,6 +704,7 @@ func (s *Store) ListTasksByEpic(epicID string) ([]*types.Task, error) {
 
 		task.Description = description.String
 		task.EpicID = epicID.String
+		task.ParentID = parentID.String
 		if claimedBy.Valid {
 			task.ClaimedBy = claimedBy.String
 		}
@@ -954,4 +1085,101 @@ func (s *Store) GetWorktreeStats() (map[string]int64, error) {
 	}
 
 	return stats, nil
+}
+
+// GetSubTasks retrieves all direct sub-tasks of a parent task
+func (s *Store) GetSubTasks(parentID string) ([]*types.Task, error) {
+	rows, err := s.DB.Query(`
+		SELECT id, title, COALESCE(description, ''), COALESCE(epic_id, ''),
+		       COALESCE(parent_id, ''), sequence_number,
+		       priority, status, attempts, max_attempts,
+		       COALESCE(claimed_by, ''), COALESCE(claimed_at, 0),
+		       created_at, updated_at
+		FROM tasks
+		WHERE parent_id = ?
+		ORDER BY sequence_number ASC
+	`, parentID)
+	if err != nil {
+		return nil, fmt.Errorf("querying sub-tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var tasks []*types.Task
+	for rows.Next() {
+		var task types.Task
+		var claimedBy sql.NullString
+		var claimedAt sql.NullInt64
+		var epicID sql.NullString
+		var description sql.NullString
+		var parentID sql.NullString
+
+		err := rows.Scan(
+			&task.ID, &task.Title, &description, &epicID,
+			&parentID, &task.SequenceNumber,
+			&task.Priority, &task.Status, &task.Attempts, &task.MaxAttempts,
+			&claimedBy, &claimedAt,
+			&task.CreatedAt, &task.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning sub-task: %w", err)
+		}
+
+		task.Description = description.String
+		task.EpicID = epicID.String
+		task.ParentID = parentID.String
+		if claimedBy.Valid {
+			task.ClaimedBy = claimedBy.String
+		}
+		if claimedAt.Valid {
+			unix := claimedAt.Int64
+			task.ClaimedAt = &unix
+		}
+
+		tasks = append(tasks, &task)
+	}
+
+	return tasks, nil
+}
+
+// GetTaskTree retrieves a task with all its descendants (sub-tasks recursively)
+func (s *Store) GetTaskTree(taskID string) (*types.Task, error) {
+	task, err := s.GetTask(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Note: Use GetSubTasks() to get the children separately if needed
+	// This method returns the parent task which can be used to look up children
+	// via GetSubTasks(taskID)
+
+	return task, nil
+}
+
+// GetParentTask retrieves the parent task of a sub-task
+func (s *Store) GetParentTask(taskID string) (*types.Task, error) {
+	var parentID string
+	err := s.DB.QueryRow(`
+		SELECT COALESCE(parent_id, '') FROM tasks WHERE id = ?
+	`, taskID).Scan(&parentID)
+	if err != nil {
+		return nil, fmt.Errorf("getting parent ID: %w", err)
+	}
+
+	if parentID == "" {
+		return nil, fmt.Errorf("task has no parent")
+	}
+
+	return s.GetTask(parentID)
+}
+
+// HasSubTasks returns true if a task has any sub-tasks
+func (s *Store) HasSubTasks(taskID string) (bool, error) {
+	var count int
+	err := s.DB.QueryRow(`
+		SELECT COUNT(*) FROM tasks WHERE parent_id = ?
+	`, taskID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("checking for sub-tasks: %w", err)
+	}
+	return count > 0, nil
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,6 +58,11 @@ Database modes:
 
 			if err := store.InitSchema(); err != nil {
 				return fmt.Errorf("initializing schema: %w", err)
+			}
+
+			// Run any necessary migrations for existing databases
+			if err := store.MigrateSchema(); err != nil {
+				return fmt.Errorf("migrating schema: %w", err)
 			}
 
 			// Copy task template
@@ -275,6 +281,7 @@ func addCmd() *cobra.Command {
 	var (
 		desc      string
 		epicID    string
+		parentID  string
 		priority  int
 		blockedBy []string
 		skipValidation bool
@@ -286,7 +293,14 @@ func addCmd() *cobra.Command {
 		Long: `Add a new task to the project.
 
 Tasks are validated against quality standards to ensure they are actionable.
-Use --skip-validation to bypass validation (not recommended).`,
+Use --skip-validation to bypass validation (not recommended).
+
+Hierarchical Tasks:
+  Use --parent to create a sub-task, or use hierarchical ID syntax:
+    drover add task-123.1 "Sub-task title"
+    drover add "Sub-task title" --parent task-123
+
+Maximum depth is 2 levels (Epic → Parent → Child).`,
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, store, err := requireProject()
@@ -296,6 +310,26 @@ Use --skip-validation to bypass validation (not recommended).`,
 			defer store.Close()
 
 			title := args[0]
+
+			// Auto-detect hierarchical ID syntax (e.g., "task-123.1 Title here")
+			if parentID == "" {
+				baseID, level1, level2, _ := db.ParseHierarchicalID(title)
+				if baseID != "" && (level1 > 0 || level2 > 0) {
+					// Extract the parent ID and actual title
+					if level2 > 0 {
+						// task-123.1.2 -> parent is task-123.1
+						parentID = fmt.Sprintf("%s.%d", baseID, level1)
+					} else if level1 > 0 {
+						// task-123.1 -> parent is task-123
+						parentID = baseID
+					}
+					// Extract the actual title (after the hierarchical ID)
+					parts := db.ExtractBaseID(title)
+					if parts != title {
+						title = strings.TrimSpace(strings.TrimPrefix(title, parts+" "))
+					}
+				}
+			}
 
 			// Validate task quality unless explicitly skipped
 			if !skipValidation {
@@ -320,7 +354,14 @@ Use --skip-validation to bypass validation (not recommended).`,
 				}
 			}
 
-			task, err := store.CreateTask(title, desc, epicID, priority, blockedBy)
+			var task *types.Task
+			if parentID != "" {
+				// Create sub-task with hierarchical ID
+				task, err = store.CreateSubTask(title, desc, parentID, priority, blockedBy)
+			} else {
+				// Create regular task
+				task, err = store.CreateTask(title, desc, epicID, priority, blockedBy)
+			}
 			if err != nil {
 				return err
 			}
@@ -332,6 +373,7 @@ Use --skip-validation to bypass validation (not recommended).`,
 
 	command.Flags().StringVarP(&desc, "description", "d", "", "Task description")
 	command.Flags().StringVarP(&epicID, "epic", "e", "", "Assign to epic")
+	command.Flags().StringVarP(&parentID, "parent", "P", "", "Parent task ID (creates sub-task)")
 	command.Flags().IntVarP(&priority, "priority", "p", 0, "Task priority (higher = more urgent)")
 	command.Flags().StringSliceVar(&blockedBy, "blocked-by", nil, "Task IDs this depends on")
 	command.Flags().BoolVar(&skipValidation, "skip-validation", false, "Skip task quality validation (not recommended)")
@@ -377,6 +419,7 @@ func epicCmd() *cobra.Command {
 
 func statusCmd() *cobra.Command {
 	var watchMode bool
+	var treeMode bool
 
 	command := &cobra.Command{
 		Use:   "status",
@@ -392,6 +435,10 @@ func statusCmd() *cobra.Command {
 				return runWatchMode(store)
 			}
 
+			if treeMode {
+				return printTreeStatus(store)
+			}
+
 			status, err := store.GetProjectStatus()
 			if err != nil {
 				return err
@@ -403,6 +450,7 @@ func statusCmd() *cobra.Command {
 	}
 
 	command.Flags().BoolVarP(&watchMode, "watch", "w", false, "Watch mode - live updates")
+	command.Flags().BoolVarP(&treeMode, "tree", "t", false, "Tree mode - show hierarchical view")
 	return command
 }
 
@@ -716,6 +764,76 @@ func printProgressBar(percent float64) {
 		}
 	}
 	fmt.Printf("] %.1f%%\n", percent)
+}
+
+// printTreeStatus displays tasks in a hierarchical tree view
+func printTreeStatus(store *db.Store) error {
+	fmt.Println("\n🐂 Drover Task Tree")
+	fmt.Println("════════════════════")
+
+	// Get all tasks
+	tasks, err := store.ListTasks()
+	if err != nil {
+		return fmt.Errorf("listing tasks: %w", err)
+	}
+
+	// Separate root tasks (no parent) from sub-tasks
+	var rootTasks []*types.Task
+	subTasks := make(map[string][]*types.Task) // parent_id -> children
+
+	for _, task := range tasks {
+		if task.ParentID == "" {
+			rootTasks = append(rootTasks, task)
+		} else {
+			subTasks[task.ParentID] = append(subTasks[task.ParentID], task)
+		}
+	}
+
+	// Print tree structure
+	for _, root := range rootTasks {
+		printTaskNode(root, subTasks, "", true)
+	}
+
+	return nil
+}
+
+// printTaskNode recursively prints a task and its children
+func printTaskNode(task *types.Task, subTasks map[string][]*types.Task, prefix string, isLast bool) {
+	// Task status icons
+	statusIcon := map[types.TaskStatus]string{
+		types.TaskStatusReady:      "⏳",
+		types.TaskStatusClaimed:    "🔒",
+		types.TaskStatusInProgress: "🔄",
+		types.TaskStatusCompleted:  "✅",
+		types.TaskStatusFailed:     "❌",
+		types.TaskStatusBlocked:    "🚫",
+	}
+	icon := statusIcon[task.Status]
+	if icon == "" {
+		icon = "⏳"
+	}
+
+	// Print current task
+	connector := "└── "
+	if prefix == "" {
+		connector = ""
+	}
+	fmt.Printf("%s%s%s %s: %s\n", prefix, connector, icon, task.ID, task.Title)
+
+	// Print children if any
+	children := subTasks[task.ID]
+	if len(children) > 0 {
+		newPrefix := prefix
+		if prefix != "" {
+			newPrefix = prefix + "    "
+		} else {
+			newPrefix = "    "
+		}
+		for i, child := range children {
+			isLastChild := i == len(children)-1
+			printTaskNode(child, subTasks, newPrefix, isLastChild)
+		}
+	}
 }
 
 // worktreeCmd returns the worktree management command
