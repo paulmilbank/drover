@@ -43,11 +43,11 @@ flowchart TB
             wtN[".drover/worktrees/task-N"]
         end
 
-        subgraph Claude["Claude Code Agents"]
-            cc1["claude -p prompt"]
-            cc2["claude -p prompt"]
-            cc3["claude -p prompt"]
-            ccN["claude -p prompt"]
+        subgraph Agents["AI Agents (Pluggable)"]
+            cc1["Agent 1 (Claude/Codex/Amp)"]
+            cc2["Agent 2 (Claude/Codex/Amp)"]
+            cc3["Agent 3 (Claude/Codex/Amp)"]
+            ccN["Agent N (Claude/Codex/Amp)"]
         end
     end
 
@@ -129,7 +129,7 @@ flowchart TB
 ```mermaid
 graph LR
     subgraph External["External Dependencies"]
-        claude["☁️ Claude Code<br/>(AI Agent)"]
+        agents["☁️ AI Agents<br/>(Claude/Codex/Amp)"]
         git["📁 Git<br/>(Version Control)"]
         pg["🐘 PostgreSQL<br/>(Production)"]
         sqlite["📄 SQLite<br/>(Development)"]
@@ -143,7 +143,7 @@ graph LR
         subgraph internal["internal/"]
             workflows["workflows.go<br/><i>DBOS workflows</i>"]
             database["database.go<br/><i>Task state</i>"]
-            executor["executor.go<br/><i>Claude runner</i>"]
+            executor["executor/<br/><i>Agent interface & impls</i>"]
             gitops["git.go<br/><i>Worktree ops</i>"]
         end
 
@@ -193,7 +193,7 @@ drover/
 ├── internal/
 │   ├── config/              # Configuration loading
 │   ├── db/                  # Database operations
-│   ├── orchestrator/        # Main run orchestration
+│   ├── executor/            # Agent interface (Claude/Codex/Amp)
 │   ├── workflow/            # DBOS workflow definitions
 │   └── git/                 # Git worktree management
 ├── pkg/
@@ -220,7 +220,7 @@ User Input → CLI Command → DBOS Workflow → Database Query
                             ↓           ↓           ↓
                       Worktree 1  Worktree 2  Worktree N
                             ↓           ↓           ↓
-                      Claude Code  Claude Code  Claude Code
+                      Agent (Claude/Codex/Amp)  ...
                             ↓           ↓           ↓
                       Git Commit   Git Commit   Git Commit
                             └───────────┼───────────┘

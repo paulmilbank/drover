@@ -548,8 +548,12 @@ func resetCmd() *cobra.Command {
 	)
 
 	command := &cobra.Command{
-		Use:   "reset",
+		Use:   "reset [TASK_IDS...]",
 		Short: "Reset tasks back to ready status",
+		Long: `Reset tasks back to ready status.
+
+If task IDs are provided, only those specific tasks will be reset.
+Otherwise, use flags to specify which statuses to reset.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, store, err := requireProject()
 			if err != nil {
@@ -557,6 +561,17 @@ func resetCmd() *cobra.Command {
 			}
 			defer store.Close()
 
+			// If specific task IDs are provided, reset only those
+			if len(args) > 0 {
+				count, err := store.ResetTasksByIDs(args)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("🔄 Reset %d task(s) to ready status\n", count)
+				return nil
+			}
+
+			// Otherwise, use status-based reset (existing behavior)
 			var statusesToReset []types.TaskStatus
 
 			if resetCompleted {

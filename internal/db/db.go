@@ -759,6 +759,45 @@ func (s *Store) ResetTasks(statusesToReset []types.TaskStatus) (int, error) {
 	return int(rowsAffected), nil
 }
 
+// ResetTasksByIDs resets specific tasks by their IDs back to ready status
+func (s *Store) ResetTasksByIDs(taskIDs []string) (int, error) {
+	if len(taskIDs) == 0 {
+		return 0, nil
+	}
+
+	now := time.Now().Unix()
+
+	// Build placeholder list for SQL IN clause
+	placeholders := make([]string, len(taskIDs))
+	args := make([]interface{}, len(taskIDs)+1)
+	// Put timestamp first since it's for updated_at = ?
+	args[0] = now
+	for i, id := range taskIDs {
+		placeholders[i] = "?"
+		args[i+1] = id
+	}
+
+	// Reset tasks to ready status
+	query := fmt.Sprintf(`
+		UPDATE tasks
+		SET status = 'ready', claimed_by = NULL, claimed_at = NULL,
+		    attempts = 0, last_error = NULL, updated_at = ?
+		WHERE id IN (%s)
+	`, strings.Join(placeholders, ", "))
+
+	result, err := s.DB.Exec(query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("resetting tasks by IDs: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("getting affected rows: %w", err)
+	}
+
+	return int(rowsAffected), nil
+}
+
 // generateID generates a unique ID with the given prefix
 func generateID(prefix string) string {
 	// Simple ID generation - in production use UUID or similar

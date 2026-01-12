@@ -90,6 +90,9 @@ go install github.com/cloud-shuttle/drover@latest
 | `drover status` | Show current project status |
 | `drover status --watch` | Live progress updates |
 | `drover status --tree` | Show hierarchical task tree |
+| `drover reset` | Reset all tasks back to ready |
+| `drover reset task-abc task-def` | Reset specific tasks by ID |
+| `drover reset --failed` | Reset all failed tasks |
 | `drover resume` | Resume interrupted workflows |
 | `drover worktree prune` | Clean up completed task worktrees |
 | `drover worktree prune -a` | Clean up all worktrees (incl. build artifacts) |
@@ -104,7 +107,34 @@ export DROVER_DATABASE_URL="postgresql://localhost/drover"
 
 # Or use SQLite explicitly
 export DROVER_DATABASE_URL="sqlite:///.drover.db"
+
+# Agent selection (default: claude)
+export DROVER_AGENT_TYPE="claude"  # Options: claude, codex, amp
+export DROVER_AGENT_PATH="/path/to/agent"  # Optional: custom agent binary path
 ```
+
+### Agent Types
+
+Drover supports multiple AI coding agents through a pluggable interface:
+
+| Agent | Type | Description |
+|-------|------|-------------|
+| **Claude Code** | `claude` | Anthropic's Claude Code CLI (default) |
+| **Codex** | `codex` | OpenAI's Codex agent |
+| **Amp** | `amp` | Amp AI agent |
+
+```bash
+# Use Codex instead of Claude
+export DROVER_AGENT_TYPE="codex"
+drover run
+
+# Use Amp with a custom binary path
+export DROVER_AGENT_TYPE="amp"
+export DROVER_AGENT_PATH="/usr/local/bin/amp"
+drover run
+```
+
+**Note:** The deprecated `DROVER_CLAUDE_PATH` environment variable still works for backwards compatibility.
 
 ### Observability
 
@@ -349,7 +379,8 @@ Drover is built on a pure Go stack:
 | CLI | Cobra | Command-line interface |
 | Workflows | DBOS Go | Durable execution |
 | Database | PostgreSQL/SQLite | State persistence |
-| AI Agent | Claude Code | Task execution |
+| Agent Interface | Pluggable | Support for Claude, Codex, Amp |
+| AI Agents | Claude/Codex/Amp | Task execution |
 | Isolation | Git Worktrees | Parallel workspaces |
 | Observability | OpenTelemetry | Traces & metrics |
 

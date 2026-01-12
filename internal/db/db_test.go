@@ -489,3 +489,110 @@ func TestStore_GetBlockedBy_NoDependencies(t *testing.T) {
 		t.Errorf("Expected 0 blockers, got %d", len(blockedBy))
 	}
 }
+
+func TestStore_ResetTasksByIDs(t *testing.T) {
+	store, _ := setupTestDB(t)
+	defer store.Close()
+
+	// Create multiple test tasks
+	task1, err := store.CreateTask("Task 1", "Description 1", "", 10, nil)
+	if err != nil {
+		t.Fatalf("Failed to create task 1: %v", err)
+	}
+
+	task2, err := store.CreateTask("Task 2", "Description 2", "", 10, nil)
+	if err != nil {
+		t.Fatalf("Failed to create task 2: %v", err)
+	}
+
+	task3, err := store.CreateTask("Task 3", "Description 3", "", 10, nil)
+	if err != nil {
+		t.Fatalf("Failed to create task 3: %v", err)
+	}
+
+	// Mark task1 and task2 as completed
+	if err := store.UpdateTaskStatus(task1.ID, types.TaskStatusCompleted, ""); err != nil {
+		t.Fatalf("Failed to mark task1 as completed: %v", err)
+	}
+	if err := store.UpdateTaskStatus(task2.ID, types.TaskStatusCompleted, ""); err != nil {
+		t.Fatalf("Failed to mark task2 as completed: %v", err)
+	}
+
+	// Mark task3 as failed
+	if err := store.UpdateTaskStatus(task3.ID, types.TaskStatusFailed, "test error"); err != nil {
+		t.Fatalf("Failed to mark task3 as failed: %v", err)
+	}
+
+	// Increment attempts for task1 so we can verify it's reset
+	if err := store.IncrementTaskAttempts(task1.ID); err != nil {
+		t.Fatalf("Failed to increment attempts: %v", err)
+	}
+
+	// Reset only task1 and task2 by ID
+	count, err := store.ResetTasksByIDs([]string{task1.ID, task2.ID})
+	if err != nil {
+		t.Fatalf("ResetTasksByIDs failed: %v", err)
+	}
+
+	if count != 2 {
+		t.Errorf("Expected to reset 2 tasks, got %d", count)
+	}
+
+	// Verify task1 and task2 are back to ready
+	status1, _ := store.GetTaskStatus(task1.ID)
+	if status1 != types.TaskStatusReady {
+		t.Errorf("Expected task1 status to be 'ready', got '%s'", status1)
+	}
+
+	status2, _ := store.GetTaskStatus(task2.ID)
+	if status2 != types.TaskStatusReady {
+		t.Errorf("Expected task2 status to be 'ready', got '%s'", status2)
+	}
+
+	// Verify task3 is still failed
+	status3, _ := store.GetTaskStatus(task3.ID)
+	if status3 != types.TaskStatusFailed {
+		t.Errorf("Expected task3 status to still be 'failed', got '%s'", status3)
+	}
+
+	// Verify task1's attempts were reset
+	updatedTask1, err := store.GetTask(task1.ID)
+	if err != nil {
+		t.Fatalf("Failed to get task1: %v", err)
+	}
+	if updatedTask1.Attempts != 0 {
+		t.Errorf("Expected task1 attempts to be reset to 0, got %d", updatedTask1.Attempts)
+	}
+}
+
+func TestStore_ResetTasksByIDs_Empty(t *testing.T) {
+	store, _ := setupTestDB(t)
+	defer store.Close()
+
+	// Create a test task
+	task, err := store.CreateTask("Task 1", "Description 1", "", 10, nil)
+	if err != nil {
+		t.Fatalf("Failed to create task: %v", err)
+	}
+
+	// Mark it as completed
+	if err := store.UpdateTaskStatus(task.ID, types.TaskStatusCompleted, ""); err != nil {
+		t.Fatalf("Failed to mark task as completed: %v", err)
+	}
+
+	// Reset with empty list should do nothing
+	count, err := store.ResetTasksByIDs([]string{})
+	if err != nil {
+		t.Fatalf("ResetTasksByIDs with empty list failed: %v", err)
+	}
+
+	if count != 0 {
+		t.Errorf("Expected to reset 0 tasks with empty list, got %d", count)
+	}
+
+	// Verify task is still completed
+	status, _ := store.GetTaskStatus(task.ID)
+	if status != types.TaskStatusCompleted {
+		t.Errorf("Expected task status to still be 'completed', got '%s'", status)
+	}
+}
