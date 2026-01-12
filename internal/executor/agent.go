@@ -45,6 +45,8 @@ func NewAgent(cfg *AgentConfig) (Agent, error) {
 		return NewCodexAgent(cfg.Path, cfg.Timeout), nil
 	case "amp":
 		return NewAmpAgent(cfg.Path, cfg.Timeout), nil
+	case "opencode":
+		return NewOpenCodeAgent(cfg.Path, cfg.Timeout), nil
 	default:
 		// Default to Claude for backwards compatibility
 		return NewClaudeAgent(cfg.Path, cfg.Timeout), nil

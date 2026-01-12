@@ -109,7 +109,7 @@ export DROVER_DATABASE_URL="postgresql://localhost/drover"
 export DROVER_DATABASE_URL="sqlite:///.drover.db"
 
 # Agent selection (default: claude)
-export DROVER_AGENT_TYPE="claude"  # Options: claude, codex, amp
+export DROVER_AGENT_TYPE="claude"  # Options: claude, codex, amp, opencode
 export DROVER_AGENT_PATH="/path/to/agent"  # Optional: custom agent binary path
 ```
 
@@ -122,6 +122,7 @@ Drover supports multiple AI coding agents through a pluggable interface:
 | **Claude Code** | `claude` | Anthropic's Claude Code CLI (default) |
 | **Codex** | `codex` | OpenAI's Codex agent |
 | **Amp** | `amp` | Amp AI agent |
+| **OpenCode** | `opencode` | OpenCode CLI by Anomaly |
 
 ```bash
 # Use Codex instead of Claude
@@ -131,6 +132,11 @@ drover run
 # Use Amp with a custom binary path
 export DROVER_AGENT_TYPE="amp"
 export DROVER_AGENT_PATH="/usr/local/bin/amp"
+drover run
+
+# Use OpenCode
+export DROVER_AGENT_TYPE="opencode"
+export DROVER_AGENT_PATH="/usr/local/bin/opencode"
 drover run
 ```
 

@@ -56,6 +56,7 @@ const (
 	AgentTypeClaudeAPI  = "claude-api"
 	AgentTypeCodex      = "codex"
 	AgentTypeAmp        = "amp"
+	AgentTypeOpenCode   = "opencode"
 
 	// Error categories
 	ErrorCategoryAgent     = "agent"
