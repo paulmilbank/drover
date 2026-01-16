@@ -14,11 +14,14 @@ import (
 	"syscall"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cloud-shuttle/drover/internal/config"
 	"github.com/cloud-shuttle/drover/internal/dashboard"
 	"github.com/cloud-shuttle/drover/internal/db"
 	"github.com/cloud-shuttle/drover/internal/git"
+	"github.com/cloud-shuttle/drover/internal/modes"
 	"github.com/cloud-shuttle/drover/internal/template"
+	"github.com/cloud-shuttle/drover/internal/tui"
 	"github.com/cloud-shuttle/drover/pkg/types"
 	"github.com/cloud-shuttle/drover/internal/workflow"
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
@@ -128,6 +131,15 @@ func runCmd() *cobra.Command {
 	var poolEnabled bool
 	var poolMinSize int
 	var poolMaxSize int
+	var workerMode string
+	var requireApproval bool
+	var planningRequireApproval bool
+	var planningAutoApproveLow bool
+	var planningMaxSteps int
+	var buildingApprovedOnly bool
+	var buildingVerifySteps bool
+	var refinementEnabled bool
+	var refinementMaxRefinements int
 
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -164,6 +176,34 @@ Pre-warmed worktrees reduce setup time for tasks.`,
 			if poolMaxSize > 0 {
 				runCfg.PoolMaxSize = poolMaxSize
 			}
+			// Override worker mode settings if flags specified
+			if workerMode != "" {
+				runCfg.WorkerMode = modes.WorkerMode(workerMode)
+			}
+			if cmd.Flags().Changed("require-approval") {
+				runCfg.RequireApproval = requireApproval
+			}
+			if cmd.Flags().Changed("planning-require-approval") {
+				runCfg.Modes.Planning.RequireApproval = planningRequireApproval
+			}
+			if cmd.Flags().Changed("planning-auto-approve-low") {
+				runCfg.Modes.Planning.AutoApproveLowComplexity = planningAutoApproveLow
+			}
+			if planningMaxSteps > 0 {
+				runCfg.Modes.Planning.MaxStepsPerPlan = planningMaxSteps
+			}
+			if cmd.Flags().Changed("building-approved-only") {
+				runCfg.Modes.Building.ExecuteApprovedOnly = buildingApprovedOnly
+			}
+			if cmd.Flags().Changed("building-verify-steps") {
+				runCfg.Modes.Building.VerifySteps = buildingVerifySteps
+			}
+			if cmd.Flags().Changed("refinement-enabled") {
+				runCfg.Modes.Refinement.Enabled = refinementEnabled
+			}
+			if refinementMaxRefinements > 0 {
+				runCfg.Modes.Refinement.MaxRefinements = refinementMaxRefinements
+			}
 
 			// Check if DBOS mode is enabled via environment variable
 			dbosURL := os.Getenv("DBOS_SYSTEM_DATABASE_URL")
@@ -184,6 +224,17 @@ Pre-warmed worktrees reduce setup time for tasks.`,
 	cmd.Flags().BoolVar(&poolEnabled, "pool", false, "Enable worktree pooling for faster cold-start")
 	cmd.Flags().IntVar(&poolMinSize, "pool-min", 0, "Minimum warm worktrees (default: 2)")
 	cmd.Flags().IntVar(&poolMaxSize, "pool-max", 0, "Maximum pooled worktrees (default: 10)")
+
+	// Worker mode flags
+	cmd.Flags().StringVar(&workerMode, "mode", "", "Worker mode: combined, planning, or building")
+	cmd.Flags().BoolVar(&requireApproval, "require-approval", false, "Require manual approval for plans")
+	cmd.Flags().BoolVar(&planningRequireApproval, "planning-require-approval", false, "Require approval for plans (planning mode)")
+	cmd.Flags().BoolVar(&planningAutoApproveLow, "planning-auto-approve-low", false, "Auto-approve low complexity plans")
+	cmd.Flags().IntVar(&planningMaxSteps, "planning-max-steps", 0, "Maximum steps per plan (default: 20)")
+	cmd.Flags().BoolVar(&buildingApprovedOnly, "building-approved-only", false, "Only execute approved plans")
+	cmd.Flags().BoolVar(&buildingVerifySteps, "building-verify-steps", false, "Verify each step after execution")
+	cmd.Flags().BoolVar(&refinementEnabled, "refinement-enabled", false, "Enable automatic plan refinement")
+	cmd.Flags().IntVar(&refinementMaxRefinements, "refinement-max-refinements", 0, "Maximum number of refinements (default: 3)")
 
 	return cmd
 }
@@ -2379,4 +2430,89 @@ func runDashboard(store *db.Store, projectDir string, port string, openBrowser b
 	}
 
 	return server.Start()
+}
+
+// planCmd manages implementation plans
+func planCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "plan",
+		Short: "Manage implementation plans",
+		Long: `Manage implementation plans for planning/building workflow separation.
+
+Use these commands to review, approve, and track plans created by planning workers.`,
+	}
+
+	cmd.AddCommand(
+		planReviewCmd(),
+	)
+
+	return cmd
+}
+
+// planReviewCmd launches the TUI for reviewing plans
+func planReviewCmd() *cobra.Command {
+	var statusFilter string
+
+	command := &cobra.Command{
+		Use:   "review",
+		Short: "Review and approve implementation plans",
+		Long: `Launch a terminal UI (TUI) for reviewing and approving implementation plans.
+
+This allows you to:
+- View all pending plans
+- Inspect plan details, steps, and risk factors
+- Approve or reject plans
+- Provide feedback for rejected plans
+
+Example:
+  drover plan review`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, store, err := requireProject()
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			// Get plans to review
+			var plans []*db.Plan
+			if statusFilter != "" {
+				filtered, err := store.ListPlans(db.PlanStatus(statusFilter))
+				if err != nil {
+					return fmt.Errorf("listing plans: %w", err)
+				}
+				plans = filtered
+			} else {
+				// Default to pending and draft plans
+				pending, err := store.ListPlans(db.PlanStatusPending)
+				if err != nil {
+					return fmt.Errorf("listing pending plans: %w", err)
+				}
+				drafts, err := store.ListPlans(db.PlanStatusDraft)
+				if err != nil {
+					return fmt.Errorf("listing draft plans: %w", err)
+				}
+				plans = append(pending, drafts...)
+			}
+
+			if len(plans) == 0 {
+				fmt.Println("No plans to review.")
+				return nil
+			}
+
+			// Launch TUI
+			return runPlanReviewTUI(plans, store)
+		},
+	}
+
+	command.Flags().StringVarP(&statusFilter, "status", "s", "", "Filter by plan status (draft, pending, approved, rejected, etc.)")
+	return command
+}
+
+// runPlanReviewTUI starts the plan review TUI
+func runPlanReviewTUI(plans []*db.Plan, store *db.Store) error {
+	// Import TUI package
+	p := tui.NewPlanReviewTUI(plans, store)
+
+	// Start bubbletea program
+	return tea.NewProgram(p).Start()
 }

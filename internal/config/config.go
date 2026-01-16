@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/cloud-shuttle/drover/internal/modes"
 )
 
 // Config holds Drover configuration
@@ -35,6 +37,10 @@ type Config struct {
 	AgentPath  string  // path to agent binary
 	ClaudePath string  // deprecated: use AgentPath instead
 
+	// Worker mode settings (for planning/building separation)
+	WorkerMode    modes.WorkerMode // "combined", "planning", or "building"
+	RequireApproval bool             // require manual approval for plans
+
 	// Beads sync settings
 	AutoSyncBeads bool
 
@@ -50,6 +56,9 @@ type Config struct {
 	PoolMaxSize      int
 	PoolWarmup       time.Duration
 	PoolCleanupOnExit bool
+
+	// Modes configuration (for planning/building separation)
+	Modes *modes.Config
 }
 
 // Load loads configuration from environment and defaults
@@ -73,6 +82,9 @@ func Load() (*Config, error) {
 		PoolMaxSize:     10,       // Maximum pooled worktrees
 		PoolWarmup:      5 * time.Minute,
 		PoolCleanupOnExit: true,   // Clean up pooled worktrees on exit
+		WorkerMode:      modes.ModeCombined, // Default to combined mode
+		RequireApproval: false,    // Default to no approval required
+		Modes:           modes.DefaultConfig(), // Default modes configuration
 	}
 
 	// Environment overrides
@@ -112,6 +124,33 @@ func Load() (*Config, error) {
 	}
 	if v := os.Getenv("DROVER_POOL_CLEANUP_ON_EXIT"); v != "" {
 		cfg.PoolCleanupOnExit = v == "true" || v == "1"
+	}
+	if v := os.Getenv("DROVER_WORKER_MODE"); v != "" {
+		cfg.WorkerMode = modes.WorkerMode(v)
+	}
+	if v := os.Getenv("DROVER_REQUIRE_APPROVAL"); v != "" {
+		cfg.RequireApproval = v == "true" || v == "1"
+	}
+	if v := os.Getenv("DROVER_PLANNING_REQUIRE_APPROVAL"); v != "" {
+		cfg.Modes.Planning.RequireApproval = v == "true" || v == "1"
+	}
+	if v := os.Getenv("DROVER_PLANNING_AUTO_APPROVE_LOW"); v != "" {
+		cfg.Modes.Planning.AutoApproveLowComplexity = v == "true" || v == "1"
+	}
+	if v := os.Getenv("DROVER_PLANNING_MAX_STEPS"); v != "" {
+		cfg.Modes.Planning.MaxStepsPerPlan = parseIntOrDefault(v, 20)
+	}
+	if v := os.Getenv("DROVER_BUILDING_APPROVED_ONLY"); v != "" {
+		cfg.Modes.Building.ExecuteApprovedOnly = v == "true" || v == "1"
+	}
+	if v := os.Getenv("DROVER_BUILDING_VERIFY_STEPS"); v != "" {
+		cfg.Modes.Building.VerifySteps = v == "true" || v == "1"
+	}
+	if v := os.Getenv("DROVER_REFINEMENT_ENABLED"); v != "" {
+		cfg.Modes.Refinement.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("DROVER_REFINEMENT_MAX_REFINEMENTS"); v != "" {
+		cfg.Modes.Refinement.MaxRefinements = parseIntOrDefault(v, 3)
 	}
 
 	// Resolve AgentPath based on AgentType if not explicitly set
