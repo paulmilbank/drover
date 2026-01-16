@@ -120,6 +120,8 @@ func Load() (*Config, error) {
 		switch cfg.AgentType {
 		case "codex":
 			cfg.AgentPath = "codex"
+		case "copilot":
+			cfg.AgentPath = "copilot"
 		case "amp":
 			cfg.AgentPath = "amp"
 		}

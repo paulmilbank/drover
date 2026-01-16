@@ -58,6 +58,7 @@ const (
 	AgentTypeCodex      = "codex"
 	AgentTypeAmp        = "amp"
 	AgentTypeOpenCode   = "opencode"
+	AgentTypeCopilot    = "copilot"
 
 	// Error categories
 	ErrorCategoryAgent     = "agent"
