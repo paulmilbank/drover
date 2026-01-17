@@ -2918,3 +2918,188 @@ func runPlanReviewTUI(plans []*db.Plan, store *db.Store) error {
 	// Start bubbletea program
 	return tea.NewProgram(p).Start()
 }
+
+// cancelCmd cancels a running or ready task
+func cancelCmd() *cobra.Command {
+	var reason string
+
+	command := &cobra.Command{
+		Use:   "cancel <task-id>",
+		Short: "Cancel a task",
+		Long: `Cancel a running, ready, or claimed task.
+
+Canceling a task will:
+  - Stop the task's execution immediately
+  - Mark the task as 'cancelled'
+  - Release any claims on the task
+  - Record the cancellation reason
+
+Use 'drover retry' to retry a cancelled task if needed.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, store, err := requireProject()
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			taskID := args[0]
+
+			// Get task details first
+			task, err := store.GetTask(taskID)
+			if err != nil {
+				return fmt.Errorf("task not found: %s", taskID)
+			}
+
+			// Check if task can be cancelled
+			if task.Status != types.TaskStatusReady && task.Status != types.TaskStatusClaimed && task.Status != types.TaskStatusInProgress {
+				return fmt.Errorf("cannot cancel task with status '%s'", task.Status)
+			}
+
+			// Cancel the task
+			if err := store.CancelTask(taskID, reason); err != nil {
+				return fmt.Errorf("cancelling task: %w", err)
+			}
+
+			fmt.Printf("✅ Cancelled task %s\n", taskID)
+			fmt.Printf("   %s\n", task.Title)
+			if reason != "" {
+				fmt.Printf("   Reason: %s\n", reason)
+			}
+
+			return nil
+		},
+	}
+
+	command.Flags().StringVar(&reason, "reason", "", "Reason for cancellation (optional)")
+	return command
+}
+
+// retryCmd retries a failed or cancelled task
+func retryCmd() *cobra.Command {
+	var force bool
+
+	command := &cobra.Command{
+		Use:   "retry <task-id>",
+		Short: "Retry a failed or cancelled task",
+		Long: `Retry a failed or cancelled task.
+
+Retrying a task will:
+  - Reset the task to 'ready' status
+  - Increment the attempt counter
+  - Clear any previous error messages
+
+By default, the task retains its attempt count. If the task has
+reached max_attempts, use --force to reset the counter and allow
+additional attempts.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, store, err := requireProject()
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			taskID := args[0]
+
+			// Get task details first
+			task, err := store.GetTask(taskID)
+			if err != nil {
+				return fmt.Errorf("task not found: %s", taskID)
+			}
+
+			// Check if task can be retried
+			if task.Status != types.TaskStatusFailed && task.Status != types.TaskStatusCancelled {
+				return fmt.Errorf("cannot retry task with status '%s'", task.Status)
+			}
+
+			// Check if force is needed
+			if task.Attempts >= task.MaxAttempts && !force {
+				fmt.Printf("⚠️  Task has reached max attempts (%d/%d)\n", task.Attempts, task.MaxAttempts)
+				fmt.Println("Use --force to reset the attempt counter and retry anyway.")
+				return fmt.Errorf("max attempts reached")
+			}
+
+			// Retry the task
+			if err := store.RetryTask(taskID, force); err != nil {
+				return fmt.Errorf("retrying task: %w", err)
+			}
+
+			fmt.Printf("✅ Retrying task %s\n", taskID)
+			fmt.Printf("   %s\n", task.Title)
+			if force {
+				fmt.Printf("   Attempt counter reset (will be attempt 1/%d)\n", task.MaxAttempts)
+			} else {
+				fmt.Printf("   Will be attempt %d/%d\n", task.Attempts+1, task.MaxAttempts)
+			}
+
+			return nil
+		},
+	}
+
+	command.Flags().BoolVar(&force, "force", false, "Reset attempt counter to retry even if max attempts reached")
+	return command
+}
+
+// resolveCmd removes blockers from a blocked task
+func resolveCmd() *cobra.Command {
+	var note string
+
+	command := &cobra.Command{
+		Use:   "resolve <task-id>",
+		Short: "Resolve blockers for a blocked task",
+		Long: `Resolve all blockers for a blocked task, setting it back to ready.
+
+Resolving a task will:
+  - Remove all 'blocked-by' dependencies
+  - Set the task status to 'ready'
+  - Record the resolution note
+
+Use this when you have manually fixed the issues that were blocking
+the task and want to allow it to proceed.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, store, err := requireProject()
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			taskID := args[0]
+
+			// Get task details first
+			task, err := store.GetTask(taskID)
+			if err != nil {
+				return fmt.Errorf("task not found: %s", taskID)
+			}
+
+			// Check if task is blocked
+			if task.Status != types.TaskStatusBlocked {
+				return fmt.Errorf("cannot resolve task with status '%s'", task.Status)
+			}
+
+			// Get blockers count for confirmation
+			blockers, err := store.GetBlockedBy(taskID)
+			if err != nil {
+				return fmt.Errorf("getting blockers: %w", err)
+			}
+
+			// Resolve the task
+			if err := store.ResolveTask(taskID, note); err != nil {
+				return fmt.Errorf("resolving task: %w", err)
+			}
+
+			fmt.Printf("✅ Resolved task %s\n", taskID)
+			fmt.Printf("   %s\n", task.Title)
+			fmt.Printf("   Removed %d blocker(s)\n", len(blockers))
+			if note != "" {
+				fmt.Printf("   Note: %s\n", note)
+			}
+
+			return nil
+		},
+	}
+
+	command.Flags().StringVar(&note, "note", "", "Note about how the issue was resolved (optional)")
+	return command
+}

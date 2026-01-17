@@ -1080,6 +1080,99 @@ func (s *Store) ResetTasksByIDs(taskIDs []string) (int, error) {
 	return int(rowsAffected), nil
 }
 
+// CancelTask cancels a running or ready task
+func (s *Store) CancelTask(taskID, reason string) error {
+	now := time.Now().Unix()
+	_, err := s.DB.Exec(`
+		UPDATE tasks
+		SET status = 'cancelled',
+		    claimed_by = NULL,
+		    claimed_at = NULL,
+		    last_error = ?,
+		    updated_at = ?
+		WHERE id = ?
+		    AND status IN ('ready', 'claimed', 'in_progress')
+	`, reason, now, taskID)
+	if err != nil {
+		return fmt.Errorf("cancelling task: %w", err)
+	}
+	return nil
+}
+
+// RetryTask resets a failed task to ready status for retry
+// If force is true, also resets the attempt counter
+func (s *Store) RetryTask(taskID string, force bool) error {
+	now := time.Now().Unix()
+	var err error
+
+	if force {
+		// Reset attempts along with status
+		_, err = s.DB.Exec(`
+			UPDATE tasks
+			SET status = 'ready',
+			    attempts = 0,
+			    claimed_by = NULL,
+			    claimed_at = NULL,
+			    last_error = NULL,
+			    updated_at = ?
+			WHERE id = ?
+			    AND status IN ('failed', 'cancelled')
+		`, now, taskID)
+	} else {
+		// Only reset status
+		_, err = s.DB.Exec(`
+			UPDATE tasks
+			SET status = 'ready',
+			    claimed_by = NULL,
+			    claimed_at = NULL,
+			    updated_at = ?
+			WHERE id = ?
+			    AND status IN ('failed', 'cancelled')
+		`, now, taskID)
+	}
+
+	if err != nil {
+		return fmt.Errorf("retrying task: %w", err)
+	}
+	return nil
+}
+
+// ResolveTask removes all blockers for a blocked task, setting it to ready
+func (s *Store) ResolveTask(taskID string, note string) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Delete all blocking dependencies for this task
+	_, err = tx.Exec(`
+		DELETE FROM task_dependencies
+		WHERE task_id = ?
+	`, taskID)
+	if err != nil {
+		return fmt.Errorf("removing dependencies: %w", err)
+	}
+
+	// Update task status to ready
+	now := time.Now().Unix()
+	_, err = tx.Exec(`
+		UPDATE tasks
+		SET status = 'ready',
+		    claimed_by = NULL,
+		    claimed_at = NULL,
+		    last_error = ?,
+		    updated_at = ?
+		WHERE id = ?
+		    AND status = 'blocked'
+	`, note, now, taskID)
+	if err != nil {
+		return fmt.Errorf("updating task: %w", err)
+	}
+
+	return tx.Commit()
+}
+
 // generateID generates a unique ID with the given prefix
 func generateID(prefix string) string {
 	// Simple ID generation - in production use UUID or similar

@@ -76,6 +76,9 @@ handles failures gracefully, and guarantees progress through crashes and restart
 		backpressureCmd(),
 		proxyCmd(),
 		planCmd(),
+		cancelCmd(),
+		retryCmd(),
+		resolveCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {

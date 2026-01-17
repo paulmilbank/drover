@@ -12,6 +12,7 @@ const (
 	TaskStatusBlocked    TaskStatus = "blocked"
 	TaskStatusCompleted  TaskStatus = "completed"
 	TaskStatusFailed     TaskStatus = "failed"
+	TaskStatusCancelled  TaskStatus = "cancelled"
 )
 
 // TaskType represents the type of work a task represents
