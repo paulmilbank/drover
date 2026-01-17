@@ -71,6 +71,11 @@ handles failures gracefully, and guarantees progress through crashes and restart
 		resumeCmdForTask(),
 		hintCmd(),
 		editCmd(),
+		flagsCmd(),
+		searchCmd(),
+		backpressureCmd(),
+		proxyCmd(),
+		planCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {

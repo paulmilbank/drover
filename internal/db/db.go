@@ -3,6 +3,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,67 @@ import (
 	"github.com/cloud-shuttle/drover/pkg/types"
 	_ "github.com/glebarez/go-sqlite"
 )
+
+// Plan types for database storage
+// These mirror the types in internal/modes but are defined here to avoid circular dependencies
+
+// PlanStatus represents the approval status of a plan
+type PlanStatus string
+
+const (
+	PlanStatusDraft     PlanStatus = "draft"
+	PlanStatusPending   PlanStatus = "pending"
+	PlanStatusApproved  PlanStatus = "approved"
+	PlanStatusRejected  PlanStatus = "rejected"
+	PlanStatusExecuting PlanStatus = "executing"
+	PlanStatusCompleted PlanStatus = "completed"
+	PlanStatusFailed    PlanStatus = "failed"
+)
+
+// PlanStep represents a single step in the implementation plan
+type PlanStep struct {
+	Order         int           `json:"order"`
+	Title         string        `json:"title"`
+	Description   string        `json:"description"`
+	Command       string        `json:"command,omitempty"`
+	Files         []string      `json:"files,omitempty"`
+	Dependencies  []int         `json:"dependencies,omitempty"`
+	EstimatedTime time.Duration `json:"estimated_time,omitempty"`
+	Verification  string        `json:"verification,omitempty"`
+}
+
+// FileSpec represents a file operation
+type FileSpec struct {
+	Path           string `json:"path"`
+	Operation      string `json:"operation"`
+	Reason         string `json:"reason,omitempty"`
+	EstimatedLines int    `json:"estimated_lines,omitempty"`
+}
+
+// Plan represents a stored implementation plan
+type Plan struct {
+	ID              string        `json:"id"`
+	TaskID          string        `json:"task_id"`
+	Title           string        `json:"title"`
+	Description     string        `json:"description"`
+	Steps           []PlanStep    `json:"steps"`
+	FilesToCreate   []FileSpec    `json:"files_to_create,omitempty"`
+	FilesToModify   []FileSpec    `json:"files_to_modify,omitempty"`
+	Dependencies    []string      `json:"dependencies,omitempty"`
+	EstimatedTime   time.Duration `json:"estimated_time,omitempty"`
+	Complexity      string        `json:"complexity,omitempty"`
+	RiskFactors     []string      `json:"risk_factors,omitempty"`
+	Status          PlanStatus    `json:"status"`
+	ApprovedBy      string        `json:"approved_by,omitempty"`
+	ApprovedAt      *time.Time    `json:"approved_at,omitempty"`
+	RejectionReason string        `json:"rejection_reason,omitempty"`
+	Revision        int           `json:"revision"`
+	ParentPlanID    string        `json:"parent_plan_id,omitempty"`
+	Feedback        []string      `json:"feedback,omitempty"`
+	CreatedAt       time.Time     `json:"created_at"`
+	UpdatedAt       time.Time     `json:"updated_at"`
+	CreatedBy       string        `json:"created_by,omitempty"`
+}
 
 // Store manages database operations
 type Store struct {
@@ -342,6 +404,51 @@ func (s *Store) MigrateSchema() error {
 		`)
 		if err != nil {
 			return fmt.Errorf("creating operators table: %w", err)
+		}
+	}
+
+	// Check if plans table exists (added for planning/building separation)
+	var plansTableExists bool
+	err = s.DB.QueryRow(`
+		SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='plans'
+	`).Scan(&plansTableExists)
+	if err != nil {
+		return fmt.Errorf("checking for plans table: %w", err)
+	}
+
+	if !plansTableExists {
+		// Create the plans table for planning/building separation
+		_, err := s.DB.Exec(`
+			CREATE TABLE plans (
+				id TEXT PRIMARY KEY,
+				task_id TEXT NOT NULL,
+				title TEXT NOT NULL,
+				description TEXT,
+				steps TEXT NOT NULL,
+				files_to_create TEXT,
+				files_to_modify TEXT,
+				dependencies TEXT,
+				estimated_time INTEGER DEFAULT 0,
+				complexity TEXT DEFAULT 'medium',
+				risk_factors TEXT,
+				status TEXT DEFAULT 'draft',
+				approved_by TEXT,
+				approved_at INTEGER,
+				rejection_reason TEXT,
+				revision INTEGER DEFAULT 1,
+				parent_plan_id TEXT,
+				feedback TEXT,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				created_by TEXT,
+				FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+			);
+			CREATE INDEX IF NOT EXISTS idx_plans_task_id ON plans(task_id);
+			CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status);
+			CREATE INDEX IF NOT EXISTS idx_plans_parent ON plans(parent_plan_id);
+		`)
+		if err != nil {
+			return fmt.Errorf("creating plans table: %w", err)
 		}
 	}
 
@@ -2025,6 +2132,248 @@ func (s *Store) DeleteOperator(name string) error {
 	return nil
 }
 
+// SavePlan saves a plan to the database
+func (s *Store) SavePlan(plan *Plan) error {
+	stepsJSON, err := jsonMarshal(plan.Steps)
+	if err != nil {
+		return fmt.Errorf("marshaling steps: %w", err)
+	}
+
+	filesToCreateJSON, err := jsonMarshal(plan.FilesToCreate)
+	if err != nil {
+		return fmt.Errorf("marshaling files_to_create: %w", err)
+	}
+
+	filesToModifyJSON, err := jsonMarshal(plan.FilesToModify)
+	if err != nil {
+		return fmt.Errorf("marshaling files_to_modify: %w", err)
+	}
+
+	dependenciesJSON, err := jsonMarshal(plan.Dependencies)
+	if err != nil {
+		return fmt.Errorf("marshaling dependencies: %w", err)
+	}
+
+	riskFactorsJSON, err := jsonMarshal(plan.RiskFactors)
+	if err != nil {
+		return fmt.Errorf("marshaling risk_factors: %w", err)
+	}
+
+	feedbackJSON, err := jsonMarshal(plan.Feedback)
+	if err != nil {
+		return fmt.Errorf("marshaling feedback: %w", err)
+	}
+
+	var approvedAt int64
+	if plan.ApprovedAt != nil {
+		approvedAt = plan.ApprovedAt.Unix()
+	}
+
+	_, err = s.DB.Exec(`
+		INSERT OR REPLACE INTO plans (
+			id, task_id, title, description, steps, files_to_create, files_to_modify,
+			dependencies, estimated_time, complexity, risk_factors, status,
+			approved_by, approved_at, rejection_reason, revision, parent_plan_id,
+			feedback, created_at, updated_at, created_by
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, plan.ID, plan.TaskID, plan.Title, plan.Description, stepsJSON,
+		filesToCreateJSON, filesToModifyJSON, dependenciesJSON,
+		int64(plan.EstimatedTime.Seconds()), plan.Complexity, riskFactorsJSON,
+		string(plan.Status), plan.ApprovedBy, approvedAt, plan.RejectionReason,
+		plan.Revision, plan.ParentPlanID, feedbackJSON,
+		plan.CreatedAt.Unix(), plan.UpdatedAt.Unix(), plan.CreatedBy)
+
+	if err != nil {
+		return fmt.Errorf("saving plan: %w", err)
+	}
+	return nil
+}
+
+// GetPlan retrieves a plan by ID
+func (s *Store) GetPlan(planID string) (*Plan, error) {
+	var plan Plan
+	var approvedAt sql.NullInt64
+
+	var stepsJSON, filesToCreateJSON, filesToModifyJSON, dependenciesJSON, riskFactorsJSON, feedbackJSON string
+
+	err := s.DB.QueryRow(`
+		SELECT id, task_id, title, description, steps, files_to_create, files_to_modify,
+			dependencies, estimated_time, complexity, risk_factors, status,
+			approved_by, approved_at, rejection_reason, revision, parent_plan_id,
+			feedback, created_at, updated_at, created_by
+		FROM plans WHERE id = ?
+	`, planID).Scan(
+		&plan.ID, &plan.TaskID, &plan.Title, &plan.Description, &stepsJSON,
+		&filesToCreateJSON, &filesToModifyJSON, &dependenciesJSON,
+		&plan.EstimatedTime, &plan.Complexity, &riskFactorsJSON,
+		&plan.Status, &plan.ApprovedBy, &approvedAt, &plan.RejectionReason,
+		&plan.Revision, &plan.ParentPlanID, &feedbackJSON,
+		&plan.CreatedAt, &plan.UpdatedAt, &plan.CreatedBy,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("plan not found: %s", planID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying plan: %w", err)
+	}
+
+	// Unmarshal JSON fields
+	if err := jsonUnmarshal(stepsJSON, &plan.Steps); err != nil {
+		return nil, fmt.Errorf("unmarshaling steps: %w", err)
+	}
+	if err := jsonUnmarshal(filesToCreateJSON, &plan.FilesToCreate); err != nil {
+		return nil, fmt.Errorf("unmarshaling files_to_create: %w", err)
+	}
+	if err := jsonUnmarshal(filesToModifyJSON, &plan.FilesToModify); err != nil {
+		return nil, fmt.Errorf("unmarshaling files_to_modify: %w", err)
+	}
+	if err := jsonUnmarshal(dependenciesJSON, &plan.Dependencies); err != nil {
+		return nil, fmt.Errorf("unmarshaling dependencies: %w", err)
+	}
+	if err := jsonUnmarshal(riskFactorsJSON, &plan.RiskFactors); err != nil {
+		return nil, fmt.Errorf("unmarshaling risk_factors: %w", err)
+	}
+	if err := jsonUnmarshal(feedbackJSON, &plan.Feedback); err != nil {
+		return nil, fmt.Errorf("unmarshaling feedback: %w", err)
+	}
+
+	// Convert estimated_time from seconds to duration
+	plan.EstimatedTime = time.Duration(plan.EstimatedTime) * time.Second
+
+	if approvedAt.Valid {
+		t := time.Unix(approvedAt.Int64, 0)
+		plan.ApprovedAt = &t
+	}
+
+	return &plan, nil
+}
+
+// GetPlanByTaskID retrieves the latest plan for a specific task
+func (s *Store) GetPlanByTaskID(taskID string) (*Plan, error) {
+	var planID string
+	err := s.DB.QueryRow(`
+		SELECT id FROM plans WHERE task_id = ?
+		ORDER BY created_at DESC, revision DESC LIMIT 1
+	`, taskID).Scan(&planID)
+
+	if err == sql.ErrNoRows {
+		return nil, nil // No plan found
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying plan by task_id: %w", err)
+	}
+
+	return s.GetPlan(planID)
+}
+
+// ListPlans lists all plans, optionally filtered by status
+func (s *Store) ListPlans(status PlanStatus) ([]*Plan, error) {
+	var rows *sql.Rows
+	var err error
+
+	if status != "" {
+		rows, err = s.DB.Query(`
+			SELECT id FROM plans WHERE status = ?
+			ORDER BY created_at DESC
+		`, string(status))
+	} else {
+		rows, err = s.DB.Query(`
+			SELECT id FROM plans ORDER BY created_at DESC
+		`)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("querying plans: %w", err)
+	}
+	defer rows.Close()
+
+	var plans []*Plan
+	for rows.Next() {
+		var planID string
+		if err := rows.Scan(&planID); err != nil {
+			return nil, fmt.Errorf("scanning plan id: %w", err)
+		}
+
+		plan, err := s.GetPlan(planID)
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, plan)
+	}
+
+	return plans, nil
+}
+
+// UpdatePlanStatus updates the status of a plan
+func (s *Store) UpdatePlanStatus(planID string, status PlanStatus, reason string) error {
+	_, err := s.DB.Exec(`
+		UPDATE plans SET status = ?, updated_at = ?, rejection_reason = ?
+		WHERE id = ?
+	`, string(status), time.Now().Unix(), reason, planID)
+
+	if err != nil {
+		return fmt.Errorf("updating plan status: %w", err)
+	}
+	return nil
+}
+
+// AddFeedback adds feedback to a plan
+func (s *Store) AddFeedback(planID string, feedback string) error {
+	// Get existing plan
+	plan, err := s.GetPlan(planID)
+	if err != nil {
+		return err
+	}
+
+	// Append feedback
+	plan.Feedback = append(plan.Feedback, feedback)
+	plan.UpdatedAt = time.Now()
+
+	// Save updated plan
+	return s.SavePlan(plan)
+}
+
+// ApprovePlan approves a plan
+func (s *Store) ApprovePlan(planID, approvedBy string) error {
+	now := time.Now()
+	_, err := s.DB.Exec(`
+		UPDATE plans SET status = 'approved', approved_by = ?, approved_at = ?, updated_at = ?
+		WHERE id = ?
+	`, approvedBy, now.Unix(), now.Unix(), planID)
+
+	if err != nil {
+		return fmt.Errorf("approving plan: %w", err)
+	}
+	return nil
+}
+
+// RejectPlan rejects a plan
+func (s *Store) RejectPlan(planID, reason string) error {
+	_, err := s.DB.Exec(`
+		UPDATE plans SET status = 'rejected', rejection_reason = ?, updated_at = ?
+		WHERE id = ?
+	`, reason, time.Now().Unix(), planID)
+
+	if err != nil {
+		return fmt.Errorf("rejecting plan: %w", err)
+	}
+	return nil
+}
+
+// DeletePlan deletes a plan
+func (s *Store) DeletePlan(planID string) error {
+	result, err := s.DB.Exec(`DELETE FROM plans WHERE id = ?`, planID)
+	if err != nil {
+		return fmt.Errorf("deleting plan: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("plan not found: %s", planID)
+	}
+	return nil
+}
+
 // generateAPIKey generates a random API key
 func generateAPIKey() string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -2033,4 +2382,18 @@ func generateAPIKey() string {
 		b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
 	}
 	return "dro_" + string(b)
+}
+
+// jsonMarshal marshals a value to JSON
+func jsonMarshal(v interface{}) (string, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// jsonUnmarshal unmarshals JSON to a value
+func jsonUnmarshal(s string, v interface{}) error {
+	return json.Unmarshal([]byte(s), v)
 }
