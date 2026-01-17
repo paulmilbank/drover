@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	ctxmngr "github.com/cloud-shuttle/drover/internal/context"
 	"github.com/cloud-shuttle/drover/pkg/telemetry"
 	"github.com/cloud-shuttle/drover/pkg/types"
 	"go.opentelemetry.io/otel/attribute"
@@ -23,6 +24,7 @@ type ClaudeAgent struct {
 	timeout           time.Duration
 	verbose           bool
 	projectGuidelines string
+	contextManager    *ctxmngr.Manager
 }
 
 // NewClaudeAgent creates a new Claude Code agent
@@ -42,6 +44,11 @@ func (a *ClaudeAgent) SetVerbose(v bool) {
 // SetProjectGuidelines sets project-specific guidelines for the agent
 func (a *ClaudeAgent) SetProjectGuidelines(guidelines string) {
 	a.projectGuidelines = guidelines
+}
+
+// SetContextManager sets the context window manager for the agent
+func (a *ClaudeAgent) SetContextManager(manager *ctxmngr.Manager) {
+	a.contextManager = manager
 }
 
 // ExecuteWithContext runs a task with a context and returns the execution result
@@ -173,7 +180,19 @@ func (a *ClaudeAgent) buildPrompt(task *types.Task) string {
 	prompt.WriteString(fmt.Sprintf("Task: %s\n", task.Title))
 
 	if task.Description != "" {
-		prompt.WriteString(fmt.Sprintf("Description: %s\n", task.Description))
+		description := task.Description
+		// Apply context window management if a manager is configured
+		if a.contextManager != nil {
+			description = a.contextManager.ManageDescription(task.Description)
+			if a.contextManager.ContentTooLarge(ctxmngr.ContentTypeDescription, task.Description) {
+				prompt.WriteString("\nDescription: [Content size exceeds threshold, using reference format]\n")
+				prompt.WriteString(description)
+			} else {
+				prompt.WriteString(fmt.Sprintf("Description: %s\n", task.Description))
+			}
+		} else {
+			prompt.WriteString(fmt.Sprintf("Description: %s\n", task.Description))
+		}
 	}
 
 	prompt.WriteString("\nPlease implement this task completely.")

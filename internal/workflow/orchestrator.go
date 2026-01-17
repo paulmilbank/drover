@@ -19,6 +19,7 @@ import (
 	"github.com/cloud-shuttle/drover/internal/analytics"
 	"github.com/cloud-shuttle/drover/internal/beads"
 	"github.com/cloud-shuttle/drover/internal/config"
+	ctxmngr "github.com/cloud-shuttle/drover/internal/context"
 	"github.com/cloud-shuttle/drover/internal/dashboard"
 	"github.com/cloud-shuttle/drover/internal/db"
 	"github.com/cloud-shuttle/drover/internal/events"
@@ -90,11 +91,16 @@ func NewOrchestrator(cfg *config.Config, store *db.Store, projectDir string) (*O
 
 	// Create the agent based on configuration with project guidelines
 	agent, err := executor.NewAgent(&executor.AgentConfig{
-		Type:             projectCfg.Agent,
-		Path:             cfg.AgentPath,
-		Timeout:          projectCfg.TaskTimeout,
-		Verbose:          cfg.Verbose,
+		Type:              projectCfg.Agent,
+		Path:              cfg.AgentPath,
+		Timeout:           projectCfg.TaskTimeout,
+		Verbose:           cfg.Verbose,
 		ProjectGuidelines: projectCfg.GetGuidelines(),
+		ContextThresholds: &ctxmngr.ContentThresholds{
+			MaxDescriptionSize: projectCfg.MaxDescriptionSize,
+			MaxDiffSize:       projectCfg.MaxDiffSize,
+			MaxFileSize:       projectCfg.MaxFileSize,
+		},
 	})
 	if err != nil {
 		if pool != nil {
@@ -102,8 +108,6 @@ func NewOrchestrator(cfg *config.Config, store *db.Store, projectDir string) (*O
 		}
 		return nil, fmt.Errorf("creating agent: %w", err)
 	}
-
-	agent.SetVerbose(cfg.Verbose)
 
 	// Log project config
 	if projectCfg.GetGuidelines() != "" {

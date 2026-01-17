@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	ctxmngr "github.com/cloud-shuttle/drover/internal/context"
 	"github.com/cloud-shuttle/drover/pkg/telemetry"
 	"github.com/cloud-shuttle/drover/pkg/types"
 	"go.opentelemetry.io/otel/attribute"
@@ -23,6 +24,7 @@ type OpenCodeAgent struct {
 	timeout           time.Duration
 	verbose           bool
 	projectGuidelines string
+	contextManager    *ctxmngr.Manager
 }
 
 // NewOpenCodeAgent creates a new OpenCode agent
@@ -42,6 +44,11 @@ func (a *OpenCodeAgent) SetVerbose(v bool) {
 // SetProjectGuidelines sets project-specific guidelines for the agent
 func (a *OpenCodeAgent) SetProjectGuidelines(guidelines string) {
 	a.projectGuidelines = guidelines
+}
+
+// SetContextManager sets the context window manager for the agent
+func (a *OpenCodeAgent) SetContextManager(manager *ctxmngr.Manager) {
+	a.contextManager = manager
 }
 
 // ExecuteWithContext runs a task with a context and returns the execution result

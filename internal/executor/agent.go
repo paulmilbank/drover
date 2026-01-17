@@ -5,6 +5,7 @@ import (
 	"context"
 	"time"
 
+	ctxmngr "github.com/cloud-shuttle/drover/internal/context"
 	"github.com/cloud-shuttle/drover/pkg/types"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -22,6 +23,9 @@ type Agent interface {
 
 	// SetProjectGuidelines sets project-specific guidelines for the agent
 	SetProjectGuidelines(guidelines string)
+
+	// SetContextManager sets the context window manager for the agent
+	SetContextManager(manager *ctxmngr.Manager)
 }
 
 // AgentConfig contains configuration for creating an agent
@@ -40,6 +44,9 @@ type AgentConfig struct {
 
 	// ProjectGuidelines contains project-specific guidelines to include in prompts
 	ProjectGuidelines string
+
+	// ContextThresholds defines size limits for content types
+	ContextThresholds *ctxmngr.ContentThresholds
 }
 
 // NewAgent creates a new Agent based on the provided configuration
@@ -63,6 +70,12 @@ func NewAgent(cfg *AgentConfig) (Agent, error) {
 	// Set project guidelines if provided
 	if cfg.ProjectGuidelines != "" {
 		agent.SetProjectGuidelines(cfg.ProjectGuidelines)
+	}
+
+	// Set context manager if thresholds are provided
+	if cfg.ContextThresholds != nil {
+		ctxManager := ctxmngr.NewManagerWithThresholds(cfg.ContextThresholds)
+		agent.SetContextManager(ctxManager)
 	}
 
 	// Set verbose mode
