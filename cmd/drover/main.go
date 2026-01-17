@@ -79,6 +79,7 @@ handles failures gracefully, and guarantees progress through crashes and restart
 		cancelCmd(),
 		retryCmd(),
 		resolveCmd(),
+		streamCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {

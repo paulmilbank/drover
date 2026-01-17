@@ -8,6 +8,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -20,12 +21,14 @@ import (
 	"github.com/cloud-shuttle/drover/internal/config"
 	"github.com/cloud-shuttle/drover/internal/dashboard"
 	"github.com/cloud-shuttle/drover/internal/db"
+	"github.com/cloud-shuttle/drover/internal/events"
 	"github.com/cloud-shuttle/drover/internal/executor"
 	"github.com/cloud-shuttle/drover/internal/git"
 	"github.com/cloud-shuttle/drover/internal/project"
 	"github.com/cloud-shuttle/drover/internal/webhooks"
 	"github.com/cloud-shuttle/drover/pkg/telemetry"
 	"github.com/cloud-shuttle/drover/pkg/types"
+	"github.com/google/uuid"
 )
 
 // Orchestrator manages the main execution loop
@@ -312,6 +315,12 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 		log.Printf("Error updating task status: %v", err)
 	}
 
+	// Record claimed event
+	o.recordEvent(events.EventTaskClaimed, task.ID, task.EpicID, map[string]any{
+		"worker": workerIDStr,
+		"title":  task.Title,
+	})
+
 	// Broadcast task started to dashboard
 	dashboard.BroadcastTaskStarted(task.ID, task.Title, workerIDStr)
 
@@ -319,6 +328,12 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 	if o.webhooks != nil {
 		o.webhooks.EmitTaskStarted(task.ID, task.Title, workerIDStr)
 	}
+
+	// Record event
+	o.recordEvent(events.EventTaskStarted, task.ID, task.EpicID, map[string]any{
+		"worker": workerIDStr,
+		"title":  task.Title,
+	})
 
 	// Start analytics tracking
 	if o.analytics != nil {
@@ -472,6 +487,13 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 		o.webhooks.EmitTaskCompleted(task.ID, task.Title, duration.Milliseconds())
 	}
 
+	// Record event
+	o.recordEvent(events.EventTaskCompleted, task.ID, task.EpicID, map[string]any{
+		"worker":   workerIDStr,
+		"title":    task.Title,
+		"duration": duration.Milliseconds(),
+	})
+
 	// End analytics tracking
 	if o.analytics != nil {
 		o.analytics.EndTask(task.ID, "success", "")
@@ -616,6 +638,24 @@ func (o *Orchestrator) executeSubTasks(workerID int, parentTask *types.Task) boo
 	return true
 }
 
+// recordEvent records an event in the database
+func (o *Orchestrator) recordEvent(eventType events.EventType, taskID, epicID string, data map[string]any) {
+	eventID := uuid.New().String()
+	timestamp := time.Now().Unix()
+
+	// Marshal event data to JSON
+	var dataJSON string
+	if len(data) > 0 {
+		if bytes, err := json.Marshal(data); err == nil {
+			dataJSON = string(bytes)
+		}
+	}
+
+	if err := o.store.RecordEvent(eventID, string(eventType), timestamp, taskID, epicID, dataJSON); err != nil {
+		log.Printf("Error recording event: %v", err)
+	}
+}
+
 // handleTaskFailure increments attempts and either retries or marks as failed
 // Returns true if the task was set to ready for retry (false if permanently failed)
 func (o *Orchestrator) handleTaskFailure(taskID, errorMsg string) bool {
@@ -645,6 +685,10 @@ func (o *Orchestrator) handleTaskFailure(taskID, errorMsg string) bool {
 		if o.analytics != nil {
 			o.analytics.EndTask(taskID, "failed", errorMsg)
 		}
+		o.recordEvent(events.EventTaskFailed, task.ID, task.EpicID, map[string]any{
+			"error":    errorMsg,
+			"attempts": task.Attempts,
+		})
 		return false
 	}
 

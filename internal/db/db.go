@@ -122,6 +122,101 @@ func (s *Store) Close() error {
 	return s.DB.Close()
 }
 
+// RecordEvent records an event in the database
+func (s *Store) RecordEvent(id string, eventType string, timestamp int64, taskID, epicID string, dataJSON string) error {
+	_, err := s.DB.Exec(`
+		INSERT INTO events (id, type, timestamp, task_id, epic_id, data)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, id, eventType, timestamp, taskID, epicID, dataJSON)
+	if err != nil {
+		return fmt.Errorf("recording event: %w", err)
+	}
+	return nil
+}
+
+// QueryEvents retrieves events from the database with optional filtering
+func (s *Store) QueryEvents(eventTypes []string, epicID, taskID string, since, until int64, limit int) ([]map[string]any, error) {
+	query := `SELECT id, type, timestamp, task_id, epic_id, data FROM events WHERE 1=1`
+	args := []any{}
+
+	if len(eventTypes) > 0 {
+		placeholders := make([]string, len(eventTypes))
+		for i, et := range eventTypes {
+			placeholders[i] = "?"
+			args = append(args, et)
+		}
+		query += ` AND type IN (` + strings.Join(placeholders, ",") + `)`
+	}
+
+	if epicID != "" {
+		query += ` AND epic_id = ?`
+		args = append(args, epicID)
+	}
+
+	if taskID != "" {
+		query += ` AND task_id = ?`
+		args = append(args, taskID)
+	}
+
+	if since > 0 {
+		query += ` AND timestamp >= ?`
+		args = append(args, since)
+	}
+
+	if until > 0 {
+		query += ` AND timestamp <= ?`
+		args = append(args, until)
+	}
+
+	query += ` ORDER BY timestamp ASC`
+
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []map[string]any
+	for rows.Next() {
+		var id, eventType, taskID string
+		var epicID sql.NullString
+		var timestamp int64
+		var data sql.NullString
+
+		err := rows.Scan(&id, &eventType, &timestamp, &taskID, &epicID, &data)
+		if err != nil {
+			return nil, fmt.Errorf("scanning event row: %w", err)
+		}
+
+		event := map[string]any{
+			"id":        id,
+			"type":      eventType,
+			"timestamp": timestamp,
+			"task_id":   taskID,
+		}
+
+		if epicID.Valid {
+			event["epic_id"] = epicID.String
+		}
+		if data.Valid {
+			event["data"] = data.String
+		}
+
+		events = append(events, event)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating event rows: %w", err)
+	}
+
+	return events, nil
+}
+
 // InitSchema creates the database schema
 func (s *Store) InitSchema() error {
 	schema := `
@@ -449,6 +544,38 @@ func (s *Store) MigrateSchema() error {
 		`)
 		if err != nil {
 			return fmt.Errorf("creating plans table: %w", err)
+		}
+	}
+
+	// Check if events table exists (added for event streaming)
+	var eventsTableExists bool
+	err = s.DB.QueryRow(`
+		SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='events'
+	`).Scan(&eventsTableExists)
+	if err != nil {
+		return fmt.Errorf("checking for events table: %w", err)
+	}
+
+	if !eventsTableExists {
+		// Create the events table for event streaming
+		_, err := s.DB.Exec(`
+			CREATE TABLE events (
+				id TEXT PRIMARY KEY,
+				type TEXT NOT NULL,
+				timestamp INTEGER NOT NULL,
+				task_id TEXT NOT NULL,
+				epic_id TEXT,
+				data TEXT,
+				FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+				FOREIGN KEY (epic_id) REFERENCES epics(id) ON DELETE CASCADE
+			);
+			CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
+			CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+			CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);
+			CREATE INDEX IF NOT EXISTS idx_events_epic_id ON events(epic_id);
+		`)
+		if err != nil {
+			return fmt.Errorf("creating events table: %w", err)
 		}
 	}
 

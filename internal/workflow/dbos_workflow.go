@@ -4,6 +4,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/cloud-shuttle/drover/internal/config"
 	"github.com/cloud-shuttle/drover/internal/dashboard"
 	"github.com/cloud-shuttle/drover/internal/db"
+	"github.com/cloud-shuttle/drover/internal/events"
 	"github.com/cloud-shuttle/drover/internal/executor"
 	"github.com/cloud-shuttle/drover/internal/git"
 	"github.com/cloud-shuttle/drover/internal/project"
@@ -24,6 +26,7 @@ import (
 	"github.com/cloud-shuttle/drover/pkg/telemetry"
 	"github.com/cloud-shuttle/drover/pkg/types"
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -408,6 +411,16 @@ func (o *DBOSOrchestrator) ExecuteTaskWorkflow(ctx dbos.DBOSContext, task TaskIn
 		o.webhooks.EmitTaskStarted(task.TaskID, task.Title, "dbos-workflow")
 	}
 
+	// Record events
+	o.recordEvent(events.EventTaskClaimed, task.TaskID, task.EpicID, map[string]any{
+		"worker": "dbos-workflow",
+		"title":  task.Title,
+	})
+	o.recordEvent(events.EventTaskStarted, task.TaskID, task.EpicID, map[string]any{
+		"worker": "dbos-workflow",
+		"title":  task.Title,
+	})
+
 	// Start analytics tracking
 	if o.analytics != nil {
 		o.analytics.StartTask(task.TaskID, task.Title, o.config.AgentType, "")
@@ -428,6 +441,9 @@ func (o *DBOSOrchestrator) ExecuteTaskWorkflow(ctx dbos.DBOSContext, task TaskIn
 		if o.analytics != nil {
 			o.analytics.EndTask(task.TaskID, "failed", errMsg)
 		}
+		o.recordEvent(events.EventTaskFailed, task.TaskID, task.EpicID, map[string]any{
+			"error": errMsg,
+		})
 		return TaskResult{Success: false, Error: errMsg}, err
 	}
 
@@ -446,6 +462,9 @@ func (o *DBOSOrchestrator) ExecuteTaskWorkflow(ctx dbos.DBOSContext, task TaskIn
 		if o.analytics != nil {
 			o.analytics.EndTask(task.TaskID, "failed", errMsg)
 		}
+		o.recordEvent(events.EventTaskFailed, task.TaskID, task.EpicID, map[string]any{
+			"error": errMsg,
+		})
 		return TaskResult{Success: false, Error: errMsg}, err
 	}
 
@@ -460,6 +479,9 @@ func (o *DBOSOrchestrator) ExecuteTaskWorkflow(ctx dbos.DBOSContext, task TaskIn
 		if o.analytics != nil {
 			o.analytics.EndTask(task.TaskID, "failed", errMsg)
 		}
+		o.recordEvent(events.EventTaskFailed, task.TaskID, task.EpicID, map[string]any{
+			"error": errMsg,
+		})
 		return TaskResult{
 			Success: false,
 			Output:  claudeResult.Output,
@@ -476,6 +498,15 @@ func (o *DBOSOrchestrator) ExecuteTaskWorkflow(ctx dbos.DBOSContext, task TaskIn
 		telemetry.RecordError(span, err, "CommitError", telemetry.ErrorCategoryGit)
 		telemetry.RecordTaskFailed(taskCtx, "dbos-workflow", "", "other", "commit_error", 0)
 		dashboard.BroadcastTaskFailed(task.TaskID, task.Title, errMsg)
+		if o.webhooks != nil {
+			o.webhooks.EmitTaskFailed(task.TaskID, task.Title, errMsg, 0)
+		}
+		if o.analytics != nil {
+			o.analytics.EndTask(task.TaskID, "failed", errMsg)
+		}
+		o.recordEvent(events.EventTaskFailed, task.TaskID, task.EpicID, map[string]any{
+			"error": errMsg,
+		})
 		return TaskResult{
 			Success: false,
 			Output:  claudeResult.Output,
@@ -502,6 +533,13 @@ func (o *DBOSOrchestrator) ExecuteTaskWorkflow(ctx dbos.DBOSContext, task TaskIn
 	if o.webhooks != nil {
 		o.webhooks.EmitTaskCompleted(task.TaskID, task.Title, duration.Milliseconds())
 	}
+
+	// Record event
+	o.recordEvent(events.EventTaskCompleted, task.TaskID, task.EpicID, map[string]any{
+		"worker":   "dbos-workflow",
+		"title":    task.Title,
+		"duration": duration.Milliseconds(),
+	})
 
 	// End analytics tracking
 	if o.analytics != nil {
@@ -554,6 +592,24 @@ func (o *DBOSOrchestrator) buildDependencyMap(tasks []TaskInput) {
 		for _, blockerID := range task.BlockedBy {
 			o.dependencyMap[blockerID] = append(o.dependencyMap[blockerID], task.TaskID)
 		}
+	}
+}
+
+// recordEvent records an event in the database
+func (o *DBOSOrchestrator) recordEvent(eventType events.EventType, taskID, epicID string, data map[string]any) {
+	eventID := uuid.New().String()
+	timestamp := time.Now().Unix()
+
+	// Marshal event data to JSON
+	var dataJSON string
+	if len(data) > 0 {
+		if bytes, err := json.Marshal(data); err == nil {
+			dataJSON = string(bytes)
+		}
+	}
+
+	if err := o.store.RecordEvent(eventID, string(eventType), timestamp, taskID, epicID, dataJSON); err != nil {
+		log.Printf("Error recording event: %v", err)
 	}
 }
 

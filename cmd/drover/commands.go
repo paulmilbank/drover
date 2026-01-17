@@ -18,6 +18,7 @@ import (
 	"github.com/cloud-shuttle/drover/internal/config"
 	"github.com/cloud-shuttle/drover/internal/dashboard"
 	"github.com/cloud-shuttle/drover/internal/db"
+	"github.com/cloud-shuttle/drover/internal/events"
 	"github.com/cloud-shuttle/drover/internal/git"
 	"github.com/cloud-shuttle/drover/internal/modes"
 	"github.com/cloud-shuttle/drover/internal/template"
@@ -25,6 +26,7 @@ import (
 	"github.com/cloud-shuttle/drover/pkg/types"
 	"github.com/cloud-shuttle/drover/internal/workflow"
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )
 
@@ -1128,6 +1130,11 @@ Use 'drover resume' to continue the task from where it left off.`,
 				return fmt.Errorf("pausing task: %w", err)
 			}
 
+			// Record paused event
+			eventID := uuid.New().String()
+			timestamp := time.Now().Unix()
+			_ = store.RecordEvent(eventID, string(events.EventTaskPaused), timestamp, taskID, task.EpicID, "")
+
 			fmt.Printf("⏸️  Paused task %s\n", taskID)
 			fmt.Printf("   %s\n", task.Title)
 			fmt.Println("\nWorktree state preserved. Use 'drover resume' to continue.")
@@ -1177,6 +1184,16 @@ Optionally provide guidance/hints that will be injected when the task continues.
 			if err := store.ResumeTask(taskID); err != nil {
 				return fmt.Errorf("resuming task: %w", err)
 			}
+
+			// Record resumed event
+			eventID := uuid.New().String()
+			timestamp := time.Now().Unix()
+			var dataJSON string
+			if hint != "" {
+				data, _ := json.Marshal(map[string]any{"hint": hint})
+				dataJSON = string(data)
+			}
+			_ = store.RecordEvent(eventID, string(events.EventTaskResumed), timestamp, taskID, task.EpicID, dataJSON)
 
 			fmt.Printf("▶️  Resumed task %s\n", taskID)
 			fmt.Printf("   %s\n", task.Title)
@@ -2961,6 +2978,16 @@ Use 'drover retry' to retry a cancelled task if needed.`,
 				return fmt.Errorf("cancelling task: %w", err)
 			}
 
+			// Record cancellation event
+			eventID := uuid.New().String()
+			timestamp := time.Now().Unix()
+			var dataJSON string
+			if reason != "" {
+				data, _ := json.Marshal(map[string]any{"reason": reason})
+				dataJSON = string(data)
+			}
+			_ = store.RecordEvent(eventID, string(events.EventTaskCancelled), timestamp, taskID, task.EpicID, dataJSON)
+
 			fmt.Printf("✅ Cancelled task %s\n", taskID)
 			fmt.Printf("   %s\n", task.Title)
 			if reason != "" {
@@ -3089,6 +3116,16 @@ the task and want to allow it to proceed.`,
 				return fmt.Errorf("resolving task: %w", err)
 			}
 
+			// Record unblocked event
+			eventID := uuid.New().String()
+			timestamp := time.Now().Unix()
+			var dataJSON string
+			if note != "" {
+				data, _ := json.Marshal(map[string]any{"note": note})
+				dataJSON = string(data)
+			}
+			_ = store.RecordEvent(eventID, string(events.EventTaskUnblocked), timestamp, taskID, task.EpicID, dataJSON)
+
 			fmt.Printf("✅ Resolved task %s\n", taskID)
 			fmt.Printf("   %s\n", task.Title)
 			fmt.Printf("   Removed %d blocker(s)\n", len(blockers))
@@ -3102,4 +3139,221 @@ the task and want to allow it to proceed.`,
 
 	command.Flags().StringVar(&note, "note", "", "Note about how the issue was resolved (optional)")
 	return command
+}
+
+// streamCmd streams task lifecycle events in real-time
+func streamCmd() *cobra.Command {
+	var (
+		eventTypes   []string
+		epicID       string
+		taskID       string
+		since        string
+		until        string
+		follow       bool
+		jsonLines    bool
+		quiet        bool
+		limit        int
+	)
+
+	command := &cobra.Command{
+		Use:   "stream",
+		Short: "Stream task lifecycle events",
+		Long: `Stream task lifecycle events in real-time.
+
+Supported event types:
+  - task.started:    Task execution began
+  - task.completed:  Task completed successfully
+  - task.failed:     Task failed
+  - task.blocked:    Task was blocked by dependencies
+  - task.unblocked:  Task blockers were resolved
+  - task.cancelled:  Task was cancelled
+  - task.claimed:    Task was claimed by a worker
+  - task.paused:     Task was paused
+  - task.resumed:    Task was resumed
+
+Examples:
+  # Stream all events in JSONL format
+  drover stream --jsonl
+
+  # Filter by event type
+  drover stream --type completed,failed
+
+  # Filter by epic
+  drover stream --epic epic-abc
+
+  # Include historical events since a timestamp
+  drover stream --since 2024-01-01T00:00:00Z
+
+  # Follow for new events (real-time streaming)
+  drover stream --follow`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, store, err := requireProject()
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			ctx := cmd.Context()
+
+			// Parse time filters
+			var sinceTS, untilTS int64
+			if since != "" {
+				t, err := time.Parse(time.RFC3339, since)
+				if err != nil {
+					return fmt.Errorf("parsing --since timestamp: %w", err)
+				}
+				sinceTS = t.Unix()
+			}
+			if until != "" {
+				t, err := time.Parse(time.RFC3339, until)
+				if err != nil {
+					return fmt.Errorf("parsing --until timestamp: %w", err)
+				}
+				untilTS = t.Unix()
+			}
+
+			// Build event type filter
+			var types []string
+			for _, t := range eventTypes {
+				// Add "task." prefix if not present
+				if !strings.HasPrefix(t, "task.") {
+					t = "task." + t
+				}
+				types = append(types, t)
+			}
+			if len(types) == 0 {
+				// Default to all event types if none specified
+				types = []string{
+					"task.started", "task.completed", "task.failed",
+					"task.blocked", "task.unblocked", "task.cancelled",
+					"task.claimed", "task.paused", "task.resumed",
+				}
+			}
+
+			// Query historical events first
+			if !follow {
+				events, err := store.QueryEvents(types, epicID, taskID, sinceTS, untilTS, limit)
+				if err != nil {
+					return fmt.Errorf("querying events: %w", err)
+				}
+
+				if jsonLines {
+					// Output in JSONL format
+					for _, e := range events {
+						data, err := json.Marshal(e)
+						if err != nil {
+							return fmt.Errorf("marshaling event: %w", err)
+						}
+						fmt.Println(string(data))
+					}
+				} else {
+					// Output in human-readable format
+					if len(events) == 0 && !quiet {
+						fmt.Println("No events found.")
+					}
+					for _, e := range events {
+						printEvent(e)
+					}
+				}
+				return nil
+			}
+
+			// Follow mode: stream events in real-time
+			// For now, just show historical events and note that follow is not yet implemented
+			if !quiet {
+				fmt.Println("📡 Streaming events...")
+				fmt.Println("Note: Real-time follow mode will be implemented in a future update.")
+				fmt.Println()
+			}
+
+			events, err := store.QueryEvents(types, epicID, taskID, sinceTS, untilTS, limit)
+			if err != nil {
+				return fmt.Errorf("querying events: %w", err)
+			}
+
+			if jsonLines {
+				for _, e := range events {
+					data, err := json.Marshal(e)
+					if err != nil {
+						return fmt.Errorf("marshaling event: %w", err)
+					}
+					fmt.Println(string(data))
+				}
+			} else {
+				for _, e := range events {
+					printEvent(e)
+				}
+			}
+
+			// In follow mode, we would poll for new events here
+			// For now, just show a message
+			if !quiet && len(events) > 0 {
+				fmt.Println()
+				fmt.Println("Waiting for new events... (Ctrl+C to exit)")
+				<-ctx.Done()
+			}
+
+			return nil
+		},
+	}
+
+	command.Flags().StringSliceVar(&eventTypes, "type", []string{}, "Filter by event type (comma-separated)")
+	command.Flags().StringVar(&epicID, "epic", "", "Filter by epic ID")
+	command.Flags().StringVar(&taskID, "task", "", "Filter by task ID")
+	command.Flags().StringVar(&since, "since", "", "Include events since timestamp (RFC3339)")
+	command.Flags().StringVar(&until, "until", "", "Include events until timestamp (RFC3339)")
+	command.Flags().BoolVar(&follow, "follow", false, "Follow for new events (real-time streaming)")
+	command.Flags().BoolVar(&jsonLines, "jsonl", false, "Output in JSON Lines format")
+	command.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress informational messages")
+	command.Flags().IntVar(&limit, "limit", 0, "Maximum number of events to return")
+
+	return command
+}
+
+// printEvent prints an event in a human-readable format
+func printEvent(event map[string]any) {
+	eventType, _ := event["type"].(string)
+	timestamp, _ := event["timestamp"].(int64)
+	taskID, _ := event["task_id"].(string)
+
+	// Format timestamp
+	t := time.Unix(timestamp, 0)
+	timeStr := t.Format("2006-01-02 15:04:05")
+
+	// Format event type
+	var emoji string
+	switch eventType {
+	case "task.started":
+		emoji = "🚀"
+	case "task.completed":
+		emoji = "✅"
+	case "task.failed":
+		emoji = "❌"
+	case "task.blocked":
+		emoji = "🚧"
+	case "task.unblocked":
+		emoji = "🔓"
+	case "task.cancelled":
+		emoji = "⛔"
+	case "task.claimed":
+		emoji = "🤖"
+	case "task.paused":
+		emoji = "⏸️"
+	case "task.resumed":
+		emoji = "▶️"
+	default:
+		emoji = "📡"
+	}
+
+	fmt.Printf("%s [%s] %s task=%s", emoji, timeStr, eventType, taskID)
+
+	if epicID, ok := event["epic_id"].(string); ok && epicID != "" {
+		fmt.Printf(" epic=%s", epicID)
+	}
+
+	if data, ok := event["data"].(string); ok && data != "" {
+		fmt.Printf(" data=%s", data)
+	}
+
+	fmt.Println()
 }
