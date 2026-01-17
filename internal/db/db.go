@@ -2361,6 +2361,19 @@ func (s *Store) RejectPlan(planID, reason string) error {
 	return nil
 }
 
+// DeletePlan deletes a plan
+func (s *Store) DeletePlan(planID string) error {
+	result, err := s.DB.Exec(`DELETE FROM plans WHERE id = ?`, planID)
+	if err != nil {
+		return fmt.Errorf("deleting plan: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("plan not found: %s", planID)
+	}
+	return nil
+}
+
 // generateAPIKey generates a random API key
 func generateAPIKey() string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
