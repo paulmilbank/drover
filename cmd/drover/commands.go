@@ -108,6 +108,50 @@ description: |
 				return fmt.Errorf("creating task template: %w", err)
 			}
 
+			// Create default project configuration
+			configPath := filepath.Join(dir, ".drover.toml")
+			configContent := `# Drover Project Configuration
+# Customize these settings for your project
+
+# Agent configuration
+agent = "claude"          # Options: claude, codex, amp, opencode
+max_workers = 4          # Number of parallel workers
+task_timeout = "60m"     # Maximum time per task
+max_attempts = 3         # Retry attempts for failed tasks
+
+# Context settings
+task_context_count = 5   # Number of recent tasks to include for context
+
+# Size thresholds (for Epic 3: Context Window Management)
+max_description_size = "250MB"  # Max task description size
+max_diff_size = "250MB"         # Max diff size to inline
+max_file_size = "1MB"           # Max file size to inline
+
+# Project-specific guidelines
+# These will be included in every task prompt
+guidelines = """
+Add your project-specific guidelines here:
+
+Example for a Go project:
+- Follow Go idioms and conventions
+- Use structured logging with slog
+- Write table-driven tests
+- Handle errors properly, don't ignore them
+
+Example for a web project:
+- Follow existing code style and patterns
+- Write tests for new features
+- Update documentation for API changes
+- Use TypeScript strict mode
+"""
+
+# Default labels to apply to all tasks
+# default_labels = ["drover", "go", "backend"]
+`
+			if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+				return fmt.Errorf("creating project config: %w", err)
+			}
+
 			fmt.Printf("🐂 Initialized Drover in %s\n", droverDir)
 			fmt.Println("\nWorkflow Engine:")
 			fmt.Println("  • DBOS with SQLite (default): Durable execution, automatic recovery")
@@ -116,8 +160,10 @@ description: |
 			fmt.Println("  drover epic add \"My Epic\"")
 			fmt.Println("  drover add \"My first task\" --epic <epic-id>")
 			fmt.Println("  drover run")
-			fmt.Println("\n📋 Task quality template created: .drover/task_template.yaml")
-			fmt.Println("   Review it before adding tasks for best results!")
+			fmt.Println("\n📋 Files created:")
+			fmt.Println("  • .drover/task_template.yaml - Task quality template")
+			fmt.Println("  • .drover.toml - Project configuration")
+			fmt.Println("\n💡 Customize .drover.toml with your project guidelines!")
 
 			return nil
 		},

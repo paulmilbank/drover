@@ -19,9 +19,10 @@ import (
 
 // OpenCodeAgent runs tasks using OpenCode CLI
 type OpenCodeAgent struct {
-	opencodePath string
-	timeout      time.Duration
-	verbose      bool
+	opencodePath      string
+	timeout           time.Duration
+	verbose           bool
+	projectGuidelines string
 }
 
 // NewOpenCodeAgent creates a new OpenCode agent
@@ -36,6 +37,11 @@ func NewOpenCodeAgent(opencodePath string, timeout time.Duration) *OpenCodeAgent
 // SetVerbose enables or disables verbose logging
 func (a *OpenCodeAgent) SetVerbose(v bool) {
 	a.verbose = v
+}
+
+// SetProjectGuidelines sets project-specific guidelines for the agent
+func (a *OpenCodeAgent) SetProjectGuidelines(guidelines string) {
+	a.projectGuidelines = guidelines
 }
 
 // ExecuteWithContext runs a task with a context and returns the execution result
@@ -145,6 +151,13 @@ func (a *OpenCodeAgent) CheckInstalled() error {
 // buildPrompt creates the OpenCode prompt for a task
 func (a *OpenCodeAgent) buildPrompt(task *types.Task) string {
 	var prompt strings.Builder
+
+	// Start with project guidelines if configured
+	if a.projectGuidelines != "" {
+		prompt.WriteString("=== PROJECT GUIDELINES ===\n")
+		prompt.WriteString(a.projectGuidelines)
+		prompt.WriteString("\n============================\n\n")
+	}
 
 	prompt.WriteString(fmt.Sprintf("Task: %s\n", task.Title))
 

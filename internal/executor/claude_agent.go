@@ -19,9 +19,10 @@ import (
 
 // ClaudeAgent runs tasks using Claude Code CLI
 type ClaudeAgent struct {
-	claudePath string
-	timeout    time.Duration
-	verbose    bool
+	claudePath        string
+	timeout           time.Duration
+	verbose           bool
+	projectGuidelines string
 }
 
 // NewClaudeAgent creates a new Claude Code agent
@@ -36,6 +37,11 @@ func NewClaudeAgent(claudePath string, timeout time.Duration) *ClaudeAgent {
 // SetVerbose enables or disables verbose logging
 func (a *ClaudeAgent) SetVerbose(v bool) {
 	a.verbose = v
+}
+
+// SetProjectGuidelines sets project-specific guidelines for the agent
+func (a *ClaudeAgent) SetProjectGuidelines(guidelines string) {
+	a.projectGuidelines = guidelines
 }
 
 // ExecuteWithContext runs a task with a context and returns the execution result
@@ -146,6 +152,13 @@ func (a *ClaudeAgent) CheckInstalled() error {
 // buildPrompt creates the Claude prompt for a task
 func (a *ClaudeAgent) buildPrompt(task *types.Task) string {
 	var prompt strings.Builder
+
+	// Start with project guidelines if configured
+	if a.projectGuidelines != "" {
+		prompt.WriteString("=== PROJECT GUIDELINES ===\n")
+		prompt.WriteString(a.projectGuidelines)
+		prompt.WriteString("\n============================\n\n")
+	}
 
 	// Start with human guidance if present
 	if task.ExecutionContext != nil && len(task.ExecutionContext.Guidance) > 0 {

@@ -20,9 +20,10 @@ import (
 // AmpAgent runs tasks using Amp CLI
 // See: https://ampcode.com/manual
 type AmpAgent struct {
-	ampPath string
-	timeout time.Duration
-	verbose bool
+	ampPath           string
+	timeout           time.Duration
+	verbose           bool
+	projectGuidelines string
 }
 
 // NewAmpAgent creates a new Amp agent
@@ -37,6 +38,11 @@ func NewAmpAgent(ampPath string, timeout time.Duration) *AmpAgent {
 // SetVerbose enables or disables verbose logging
 func (a *AmpAgent) SetVerbose(v bool) {
 	a.verbose = v
+}
+
+// SetProjectGuidelines sets project-specific guidelines for the agent
+func (a *AmpAgent) SetProjectGuidelines(guidelines string) {
+	a.projectGuidelines = guidelines
 }
 
 // ExecuteWithContext runs a task with a context and returns the execution result
@@ -153,6 +159,13 @@ func (a *AmpAgent) CheckInstalled() error {
 // buildPrompt creates the Amp prompt for a task
 func (a *AmpAgent) buildPrompt(task *types.Task) string {
 	var prompt strings.Builder
+
+	// Start with project guidelines if configured
+	if a.projectGuidelines != "" {
+		prompt.WriteString("=== PROJECT GUIDELINES ===\n")
+		prompt.WriteString(a.projectGuidelines)
+		prompt.WriteString("\n============================\n\n")
+	}
 
 	prompt.WriteString(fmt.Sprintf("Task: %s\n", task.Title))
 

@@ -19,6 +19,7 @@ import (
 	"github.com/cloud-shuttle/drover/internal/db"
 	"github.com/cloud-shuttle/drover/internal/executor"
 	"github.com/cloud-shuttle/drover/internal/git"
+	"github.com/cloud-shuttle/drover/internal/project"
 	"github.com/cloud-shuttle/drover/internal/webhooks"
 	"github.com/cloud-shuttle/drover/pkg/telemetry"
 	"github.com/cloud-shuttle/drover/pkg/types"
@@ -85,18 +86,41 @@ func NewDBOSOrchestrator(cfg *config.Config, dbosCtx dbos.DBOSContext, projectDi
 	)
 	gitMgr.SetVerbose(cfg.Verbose)
 
-	// Create the agent based on configuration
+	// Load project configuration
+	projectCfg, err := project.Load(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("loading project config: %w", err)
+	}
+
+	// Validate project config
+	if err := projectCfg.Validate(); err != nil {
+		log.Printf("[project] warning: %v", err)
+	}
+
+	// Merge project config with global config
+	projectCfg.MergeWithGlobal(cfg.AgentType, cfg.Workers, cfg.TaskTimeout, cfg.MaxTaskAttempts)
+
+	// Create the agent based on configuration with project guidelines
 	agent, err := executor.NewAgent(&executor.AgentConfig{
-		Type:    cfg.AgentType,
-		Path:    cfg.AgentPath,
-		Timeout: cfg.TaskTimeout,
-		Verbose: cfg.Verbose,
+		Type:             projectCfg.Agent,
+		Path:             cfg.AgentPath,
+		Timeout:          projectCfg.TaskTimeout,
+		Verbose:          cfg.Verbose,
+		ProjectGuidelines: projectCfg.GetGuidelines(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("creating agent: %w", err)
 	}
 
 	agent.SetVerbose(cfg.Verbose)
+
+	// Log project config
+	if projectCfg.GetGuidelines() != "" {
+		log.Printf("[project] loaded guidelines from %s", projectCfg.ConfigPath())
+	}
+	if projectCfg.HasLabels() {
+		log.Printf("[project] default labels: %v", projectCfg.GetLabels())
+	}
 
 	// Check agent is installed
 	if err := agent.CheckInstalled(); err != nil {

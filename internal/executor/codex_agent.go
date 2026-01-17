@@ -20,9 +20,10 @@ import (
 // CodexAgent runs tasks using OpenAI Codex CLI
 // See: https://developers.openai.com/codex/cli/
 type CodexAgent struct {
-	codexPath string
-	timeout   time.Duration
-	verbose   bool
+	codexPath        string
+	timeout           time.Duration
+	verbose           bool
+	projectGuidelines string
 }
 
 // NewCodexAgent creates a new Codex agent
@@ -37,6 +38,11 @@ func NewCodexAgent(codexPath string, timeout time.Duration) *CodexAgent {
 // SetVerbose enables or disables verbose logging
 func (a *CodexAgent) SetVerbose(v bool) {
 	a.verbose = v
+}
+
+// SetProjectGuidelines sets project-specific guidelines for the agent
+func (a *CodexAgent) SetProjectGuidelines(guidelines string) {
+	a.projectGuidelines = guidelines
 }
 
 // ExecuteWithContext runs a task with a context and returns the execution result
@@ -154,6 +160,13 @@ func (a *CodexAgent) CheckInstalled() error {
 // buildPrompt creates the Codex prompt for a task
 func (a *CodexAgent) buildPrompt(task *types.Task) string {
 	var prompt strings.Builder
+
+	// Start with project guidelines if configured
+	if a.projectGuidelines != "" {
+		prompt.WriteString("=== PROJECT GUIDELINES ===\n")
+		prompt.WriteString(a.projectGuidelines)
+		prompt.WriteString("\n============================\n\n")
+	}
 
 	prompt.WriteString(fmt.Sprintf("Task: %s\n", task.Title))
 
