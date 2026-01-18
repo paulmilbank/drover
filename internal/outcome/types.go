@@ -54,15 +54,16 @@ func (v Verdict) Icon() string {
 
 // Outcome represents the complete structured outcome of a task execution
 type Outcome struct {
-	Verdict    Verdict            `json:"verdict"`
-	Reason     string            `json:"reason,omitempty"`
-	Summary    string            `json:"summary,omitempty"`
-	Details    string            `json:"details,omitempty"`
-	Timestamp  time.Time         `json:"timestamp"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
-	Blockers   []string          `json:"blockers,omitempty"` // Blocked-by task IDs
-	ExitCode   int               `json:"exit_code,omitempty"`
-	Changes    *ChangeInfo       `json:"changes,omitempty"`
+	Verdict      Verdict            `json:"verdict"`
+	Reason       string            `json:"reason,omitempty"`
+	Summary      string            `json:"summary,omitempty"`
+	Details      string            `json:"details,omitempty"`
+	Timestamp    time.Time         `json:"timestamp"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	Blockers     []string          `json:"blockers,omitempty"` // Blocked-by task IDs
+	ExitCode     int               `json:"exit_code,omitempty"`
+	Changes      *ChangeInfo       `json:"changes,omitempty"`
+	TestResults  *TestResults      `json:"test_results,omitempty"` // Automated test results
 }
 
 // ChangeInfo represents information about code changes made
@@ -71,6 +72,19 @@ type ChangeInfo struct {
 	LinesAdded    int    `json:"lines_added"`
 	LinesDeleted  int    `json:"lines_deleted"`
 	CommitHash    string `json:"commit_hash,omitempty"`
+}
+
+// TestResults represents the outcome of automated test execution
+type TestResults struct {
+	Passed    int          `json:"passed"`
+	Failed    int          `json:"failed"`
+	Skipped   int          `json:"skipped"`
+	Total     int          `json:"total"`
+	Duration  int64        `json:"duration_ms"`
+	Output    string       `json:"output,omitempty"`
+	Error     string       `json:"error,omitempty"`
+	RunTests   bool         `json:"run_tests"` // Whether tests were actually run
+	Timestamp time.Time    `json:"timestamp"`
 }
 
 // Parser parses agent output to extract structured outcomes
@@ -353,6 +367,16 @@ func FormatOutcome(outcome *Outcome) string {
 			outcome.Changes.FilesModified,
 			outcome.Changes.LinesAdded,
 			outcome.Changes.LinesDeleted))
+	}
+
+	if outcome.TestResults != nil && outcome.TestResults.RunTests {
+		if outcome.TestResults.Failed > 0 {
+			sb.WriteString(fmt.Sprintf("  Tests: %d/%d passed (%d failed, %d skipped) ❌\n",
+				outcome.TestResults.Passed, outcome.TestResults.Total, outcome.TestResults.Failed, outcome.TestResults.Skipped))
+		} else {
+			sb.WriteString(fmt.Sprintf("  Tests: %d/%d passed ✅\n",
+				outcome.TestResults.Passed, outcome.TestResults.Total))
+		}
 	}
 
 	return sb.String()

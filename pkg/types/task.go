@@ -58,6 +58,9 @@ type Task struct {
 	Operator       string                `json:"operator" db:"operator"` // The operator/user who created or claimed this task
 	Verdict        TaskVerdict           `json:"verdict" db:"verdict"`     // Structured outcome verdict
 	VerdictReason   string               `json:"verdict_reason" db:"verdict_reason"` // Reason for verdict
+	TestMode       string                `json:"test_mode,omitempty" db:"test_mode"`       // Test execution mode (strict/lenient/disabled)
+	TestScope      string                `json:"test_scope,omitempty" db:"test_scope"`     // Test scope (all/diff/skip)
+	TestCommand    string                `json:"test_command,omitempty" db:"test_command"` // Custom test command
 	CreatedAt      int64                 `json:"created_at" db:"created_at"`
 	UpdatedAt      int64                 `json:"updated_at" db:"updated_at"`
 	// ExecutionContext is not persisted in DB - it's set at runtime for execution

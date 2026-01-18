@@ -601,6 +601,27 @@ func (s *Store) MigrateSchema() error {
 		}
 	}
 
+	// Check if test_mode column exists (added for automated test execution)
+	var testModeExists bool
+	err = s.DB.QueryRow(`
+		SELECT COUNT(*) > 0 FROM pragma_table_info('tasks') WHERE name = 'test_mode'
+	`).Scan(&testModeExists)
+	if err != nil {
+		return fmt.Errorf("checking for test_mode column: %w", err)
+	}
+
+	if !testModeExists {
+		// Add test configuration columns for automated test execution
+		_, err := s.DB.Exec(`
+			ALTER TABLE tasks ADD COLUMN test_mode TEXT DEFAULT 'strict';
+			ALTER TABLE tasks ADD COLUMN test_scope TEXT DEFAULT 'diff';
+			ALTER TABLE tasks ADD COLUMN test_command TEXT;
+		`)
+		if err != nil {
+			return fmt.Errorf("adding test configuration columns: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -636,6 +657,11 @@ func (s *Store) CreateTask(title, description, epicID string, priority int, bloc
 
 // CreateTaskWithOperator creates a new task with an operator (user/creator)
 func (s *Store) CreateTaskWithOperator(title, description, epicID string, priority int, blockedBy []string, operator string) (*types.Task, error) {
+	return s.CreateTaskWithTestConfig(title, description, epicID, priority, blockedBy, operator, "", "", "")
+}
+
+// CreateTaskWithTestConfig creates a new task with test configuration
+func (s *Store) CreateTaskWithTestConfig(title, description, epicID string, priority int, blockedBy []string, operator, testMode, testScope, testCommand string) (*types.Task, error) {
 	id := generateID("task")
 	now := time.Now().Unix()
 
@@ -648,6 +674,9 @@ func (s *Store) CreateTaskWithOperator(title, description, epicID string, priori
 		Status:      types.TaskStatusReady,
 		MaxAttempts: 3,
 		Operator:    operator,
+		TestMode:    testMode,
+		TestScope:   testScope,
+		TestCommand: testCommand,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -669,9 +698,9 @@ func (s *Store) CreateTaskWithOperator(title, description, epicID string, priori
 		epicIDValue = nil
 	}
 	_, err = tx.Exec(`
-		INSERT INTO tasks (id, title, description, epic_id, type, priority, status, operator, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, task.ID, task.Title, task.Description, epicIDValue, task.Type, task.Priority, task.Status, task.Operator, task.CreatedAt, task.UpdatedAt)
+		INSERT INTO tasks (id, title, description, epic_id, type, priority, status, operator, test_mode, test_scope, test_command, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, task.ID, task.Title, task.Description, epicIDValue, task.Type, task.Priority, task.Status, task.Operator, task.TestMode, task.TestScope, task.TestCommand, task.CreatedAt, task.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("creating task: %w", err)
 	}
@@ -1042,6 +1071,17 @@ func (s *Store) SetTaskVerdict(taskID string, verdict types.TaskVerdict, reason 
 	return err
 }
 
+// SetTaskTestConfig updates the test configuration for a task
+func (s *Store) SetTaskTestConfig(taskID, testMode, testScope, testCommand string) error {
+	now := time.Now().Unix()
+	_, err := s.DB.Exec(`
+		UPDATE tasks
+		SET test_mode = ?, test_scope = ?, test_command = ?, updated_at = ?
+		WHERE id = ?
+	`, testMode, testScope, testCommand, now, taskID)
+	return err
+}
+
 // IncrementTaskAttempts increments the attempt counter for a task
 func (s *Store) IncrementTaskAttempts(taskID string) error {
 	now := time.Now().Unix()
@@ -1062,6 +1102,9 @@ func (s *Store) GetTask(taskID string) (*types.Task, error) {
 	var description sql.NullString
 	var operator sql.NullString
 	var verdictReason sql.NullString
+	var testMode sql.NullString
+	var testScope sql.NullString
+	var testCommand sql.NullString
 
 	err := s.DB.QueryRow(`
 		SELECT id, title, COALESCE(description, ''), COALESCE(epic_id, ''),
@@ -1070,7 +1113,11 @@ func (s *Store) GetTask(taskID string) (*types.Task, error) {
 		       priority, status, attempts, max_attempts,
 		       COALESCE(claimed_by, ''), COALESCE(claimed_at, 0),
 		       COALESCE(operator, ''), COALESCE(verdict, 'unknown'),
-		       COALESCE(verdict_reason, ''), created_at, updated_at
+		       COALESCE(verdict_reason, ''),
+		       COALESCE(test_mode, 'strict'),
+		       COALESCE(test_scope, 'diff'),
+		       COALESCE(test_command, ''),
+		       created_at, updated_at
 		FROM tasks
 		WHERE id = ?
 	`, taskID).Scan(
@@ -1080,6 +1127,7 @@ func (s *Store) GetTask(taskID string) (*types.Task, error) {
 		&task.Priority, &task.Status, &task.Attempts, &task.MaxAttempts,
 		&claimedBy, &claimedAt, &operator,
 		&task.Verdict, &verdictReason,
+		&testMode, &testScope, &testCommand,
 		&task.CreatedAt, &task.UpdatedAt,
 	)
 
@@ -1091,6 +1139,9 @@ func (s *Store) GetTask(taskID string) (*types.Task, error) {
 	task.EpicID = epicID.String
 	task.Operator = operator.String
 	task.VerdictReason = verdictReason.String
+	task.TestMode = testMode.String
+	task.TestScope = testScope.String
+	task.TestCommand = testCommand.String
 	if claimedBy.Valid {
 		task.ClaimedBy = claimedBy.String
 	}
@@ -1362,7 +1413,11 @@ func (s *Store) ListTasksByEpic(epicID string) ([]*types.Task, error) {
 			       COALESCE(type, 'other'),
 			       priority, status, attempts, max_attempts,
 			       COALESCE(claimed_by, ''), COALESCE(claimed_at, 0),
-			       COALESCE(operator, ''), created_at, updated_at
+			       COALESCE(operator, ''),
+			       COALESCE(test_mode, 'strict'),
+			       COALESCE(test_scope, 'diff'),
+			       COALESCE(test_command, ''),
+			       created_at, updated_at
 			FROM tasks
 			WHERE epic_id = ?
 			ORDER BY created_at ASC
@@ -1375,7 +1430,11 @@ func (s *Store) ListTasksByEpic(epicID string) ([]*types.Task, error) {
 			       COALESCE(type, 'other'),
 			       priority, status, attempts, max_attempts,
 			       COALESCE(claimed_by, ''), COALESCE(claimed_at, 0),
-			       COALESCE(operator, ''), created_at, updated_at
+			       COALESCE(operator, ''),
+			       COALESCE(test_mode, 'strict'),
+			       COALESCE(test_scope, 'diff'),
+			       COALESCE(test_command, ''),
+			       created_at, updated_at
 			FROM tasks
 			ORDER BY created_at ASC
 		`)
@@ -1395,6 +1454,9 @@ func (s *Store) ListTasksByEpic(epicID string) ([]*types.Task, error) {
 		var description sql.NullString
 		var parentID sql.NullString
 		var operator sql.NullString
+		var testMode sql.NullString
+		var testScope sql.NullString
+		var testCommand sql.NullString
 
 		err := rows.Scan(
 			&task.ID, &task.Title, &description, &epicID,
@@ -1402,6 +1464,7 @@ func (s *Store) ListTasksByEpic(epicID string) ([]*types.Task, error) {
 			&task.Type,
 			&task.Priority, &task.Status, &task.Attempts, &task.MaxAttempts,
 			&claimedBy, &claimedAt, &operator,
+			&testMode, &testScope, &testCommand,
 			&task.CreatedAt, &task.UpdatedAt,
 		)
 		if err != nil {
@@ -1412,6 +1475,9 @@ func (s *Store) ListTasksByEpic(epicID string) ([]*types.Task, error) {
 		task.EpicID = epicID.String
 		task.ParentID = parentID.String
 		task.Operator = operator.String
+		task.TestMode = testMode.String
+		task.TestScope = testScope.String
+		task.TestCommand = testCommand.String
 		if claimedBy.Valid {
 			task.ClaimedBy = claimedBy.String
 		}

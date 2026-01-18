@@ -27,10 +27,12 @@ import (
 	"github.com/cloud-shuttle/drover/internal/executor"
 	"github.com/cloud-shuttle/drover/internal/git"
 	"github.com/cloud-shuttle/drover/internal/project"
+	"github.com/cloud-shuttle/drover/internal/testing"
 	"github.com/cloud-shuttle/drover/internal/webhooks"
 	"github.com/cloud-shuttle/drover/pkg/telemetry"
 	"github.com/cloud-shuttle/drover/pkg/types"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Orchestrator manages the main execution loop
@@ -488,6 +490,17 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 		// Don't return here - continue to mark task as complete
 	}
 
+	// Run automated tests before task completion
+	if err := o.runTests(task.ID, worktreePath, taskSpan); err != nil {
+		log.Printf("❌ Task %s failed automated tests: %v", task.ID, err)
+		telemetry.RecordError(taskSpan, err, "TestExecutionFailed", "tests")
+		telemetry.SetTaskStatus(taskSpan, "failed")
+		if o.handleTaskFailure(task.ID, err.Error()) {
+			taskCompleted = true // Task set to ready for retry
+		}
+		return
+	}
+
 	// Mark complete and unblock dependents
 	if err := o.store.CompleteTask(task.ID); err != nil {
 		log.Printf("Error completing task: %v", err)
@@ -731,6 +744,88 @@ func (o *Orchestrator) handleTaskFailure(taskID, errorMsg string) bool {
 	_ = o.store.UpdateTaskStatus(taskID, types.TaskStatusReady, errorMsg)
 	log.Printf("🔄 Task %s retrying (attempt %d/%d)", taskID, task.Attempts+1, task.MaxAttempts)
 	return true
+}
+
+// runTests executes automated tests before task completion
+// Returns an error if tests fail and the task is configured to block on test failures
+func (o *Orchestrator) runTests(taskID, worktreePath string, taskSpan trace.Span) error {
+	// Get the task to check test configuration
+	task, err := o.store.GetTask(taskID)
+	if err != nil {
+		log.Printf("⚠️  Could not fetch task %s for test configuration: %v", taskID, err)
+		return nil // Continue without tests if we can't get config
+	}
+
+	// Build test configuration from task
+	testConfig := &testing.TestConfig{
+		Mode:    testing.TestMode(task.TestMode),
+		Scope:   testing.TestScope(task.TestScope),
+		Timeout: 5 * time.Minute,
+	}
+
+	// Override with custom command if specified
+	if task.TestCommand != "" {
+		testConfig.Command = task.TestCommand
+	}
+
+	// Default to strict mode if not set
+	if testConfig.Mode == "" {
+		testConfig.Mode = testing.TestModeStrict
+	}
+	// Default to diff scope if not set
+	if testConfig.Scope == "" {
+		testConfig.Scope = testing.TestScopeDiff
+	}
+
+	// Skip if tests are disabled
+	if testConfig.Mode == testing.TestModeDisabled {
+		return nil
+	}
+
+	// Create test runner and run tests
+	runner := testing.NewRunner(testConfig, worktreePath)
+	runner.SetVerbose(o.verbose)
+
+	result := runner.Run(worktreePath, taskID)
+
+	// If tests weren't run (no changes, etc.), that's fine
+	if !result.RunTests {
+		return nil
+	}
+
+	// Record test results in telemetry
+	if result.Success {
+		telemetry.RecordTestPassed(taskSpan, result.Passed, result.Failed, result.Skipped, result.Duration)
+	} else {
+		telemetry.RecordTestFailed(taskSpan, result.Passed, result.Failed, result.Skipped, result.Duration, result.Error)
+	}
+
+	// In lenient mode, only log warnings
+	if testConfig.Mode == testing.TestModeLenient {
+		if !result.Success {
+			log.Printf("⚠️  Tests failed (lenient mode - not blocking): %d passed, %d failed, %d skipped",
+				result.Passed, result.Failed, result.Skipped)
+			if result.Output != "" && o.verbose {
+				// Print last few lines of output
+				lines := strings.Split(result.Output, "\n")
+				if len(lines) > 10 {
+					lines = lines[len(lines)-10:]
+				}
+				for _, line := range lines {
+					log.Printf("  %s", line)
+				}
+			}
+		}
+		return nil // Don't block in lenient mode
+	}
+
+	// In strict mode, fail if tests failed
+	if !result.Success {
+		return fmt.Errorf("tests failed (strict mode): %d passed, %d failed, %d skipped\n%s",
+			result.Passed, result.Failed, result.Skipped, result.Output)
+	}
+
+	return nil
 }
 
 // printProgress prints current progress

@@ -398,12 +398,15 @@ func runWithSQLite(cmd *cobra.Command, runCfg *config.Config, store *db.Store, p
 
 func addCmd() *cobra.Command {
 	var (
-		desc      string
-		epicID    string
-		parentID  string
-		priority  int
-		blockedBy []string
+		desc         string
+		epicID       string
+		parentID     string
+		priority     int
+		blockedBy    []string
 		skipValidation bool
+		testMode     string
+		testScope    string
+		testCommand  string
 	)
 
 	command := &cobra.Command{
@@ -419,7 +422,18 @@ Hierarchical Tasks:
     drover add task-123.1 "Sub-task title"
     drover add "Sub-task title" --parent task-123
 
-Maximum depth is 2 levels (Epic → Parent → Child).`,
+Maximum depth is 2 levels (Epic → Parent → Child).
+
+Automated Testing:
+  Use --test-mode to configure when tests run:
+    strict     (default) Tests must pass for task to complete
+    lenient    Tests run but failures don't block completion
+    disabled   Tests are not run
+  Use --test-scope to configure which tests run:
+    diff       (default) Only run tests if files changed
+    all        Always run all tests
+    skip       Skip running tests
+  Use --test-command for custom test command (e.g., "make test-unit")`,
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, store, err := requireProject()
@@ -459,6 +473,12 @@ Maximum depth is 2 levels (Epic → Parent → Child).`,
 						if err != nil {
 							return err
 						}
+						// Set test configuration on sub-task if specified
+						if testMode != "" || testScope != "" || testCommand != "" {
+							if err := store.SetTaskTestConfig(subTask.ID, testMode, testScope, testCommand); err != nil {
+								return fmt.Errorf("setting test configuration: %w", err)
+							}
+						}
 						fmt.Printf("✅ Created task %s\n", subTask.ID)
 						return nil
 					}
@@ -493,8 +513,8 @@ Maximum depth is 2 levels (Epic → Parent → Child).`,
 				// Create sub-task with hierarchical ID
 				task, err = store.CreateSubTask(title, desc, parentID, priority, blockedBy)
 			} else {
-				// Create regular task
-				task, err = store.CreateTask(title, desc, epicID, priority, blockedBy)
+				// Create regular task with test configuration
+				task, err = store.CreateTaskWithTestConfig(title, desc, epicID, priority, blockedBy, "", testMode, testScope, testCommand)
 			}
 			if err != nil {
 				return err
@@ -511,6 +531,9 @@ Maximum depth is 2 levels (Epic → Parent → Child).`,
 	command.Flags().IntVarP(&priority, "priority", "p", 0, "Task priority (higher = more urgent)")
 	command.Flags().StringSliceVar(&blockedBy, "blocked-by", nil, "Task IDs this depends on")
 	command.Flags().BoolVar(&skipValidation, "skip-validation", false, "Skip task quality validation (not recommended)")
+	command.Flags().StringVar(&testMode, "test-mode", "", "Test execution mode: strict (block on failure), lenient (warn only), disabled")
+	command.Flags().StringVar(&testScope, "test-scope", "", "Test scope: diff (only if changed), all (always), skip")
+	command.Flags().StringVar(&testCommand, "test-command", "", "Custom test command (e.g., 'make test-unit')")
 	return command
 }
 

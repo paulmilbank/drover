@@ -4,6 +4,7 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -201,4 +202,28 @@ func ErrorTypeFromError(err error) string {
 		return ""
 	}
 	return fmt.Sprintf("%T", err)
+}
+
+// RecordTestPassed records successful test execution on a span
+func RecordTestPassed(span trace.Span, passed, failed, skipped int, duration time.Duration) {
+	span.AddEvent("test_passed", trace.WithAttributes(
+		attribute.Int("test.passed", passed),
+		attribute.Int("test.failed", failed),
+		attribute.Int("test.skipped", skipped),
+		attribute.Int("test.total", passed+failed+skipped),
+		attribute.Int64("test.duration_ms", duration.Milliseconds()),
+	))
+}
+
+// RecordTestFailed records failed test execution on a span
+func RecordTestFailed(span trace.Span, passed, failed, skipped int, duration time.Duration, errorMsg string) {
+	span.AddEvent("test_failed", trace.WithAttributes(
+		attribute.Int("test.passed", passed),
+		attribute.Int("test.failed", failed),
+		attribute.Int("test.skipped", skipped),
+		attribute.Int("test.total", passed+failed+skipped),
+		attribute.Int64("test.duration_ms", duration.Milliseconds()),
+		attribute.String("test.error", errorMsg),
+	))
+	span.SetStatus(codes.Error, "tests failed")
 }
