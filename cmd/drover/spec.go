@@ -18,6 +18,7 @@ func specCmd() *cobra.Command {
 		dryRun      bool
 		yes         bool
 		model       string
+		directAPI   bool
 	)
 
 	command := &cobra.Command{
@@ -36,11 +37,15 @@ The AI will automatically:
   - Generate acceptance criteria
   - Configure test modes and scopes
 
+By default, this command uses the LLM proxy server. You can use --direct-api
+to connect to Anthropic's API directly (requires ANTHROPIC_API_KEY).
+
 Examples:
   drover spec spec.md
   drover spec design/
   drover spec spec.md --dry-run
-  drover spec design/ --yes`,
+  drover spec design/ --yes
+  drover spec spec.md --direct-api`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Require project
@@ -70,26 +75,55 @@ Examples:
 			}
 			fmt.Println()
 
-			// Setup LLM client
-			baseURL := os.Getenv("DROVER_LLM_PROXY_URL")
-			if baseURL == "" {
-				baseURL = "http://localhost:8080"
+			apiKey := os.Getenv("ANTHROPIC_API_KEY")
+			if apiKey == "" {
+				return fmt.Errorf("ANTHROPIC_API_KEY environment variable is required\n\n" +
+					"Set your API key:\n" +
+					"  export ANTHROPIC_API_KEY=your_key_here\n\n" +
+					"Then run the command again.")
 			}
-
-			llmClient := client.NewClient(client.Config{
-				BaseURL: baseURL,
-				APIKey:  os.Getenv("ANTHROPIC_API_KEY"),
-				Timeout: 5 * time.Minute,
-			})
 
 			// Use specified model or default
 			if model == "" {
 				model = "claude-sonnet-4-20250514"
 			}
 
-			analyzer := spec.NewAnalyzer(llmClient, model)
+			var analyzer *spec.Analyzer
+			if directAPI {
+				// Use direct Anthropic API
+				analyzer = spec.NewAnalyzerWithDirectAPI(apiKey, model)
+				fmt.Println("🤖 Analyzing specification with AI (Direct API)...")
+			} else {
+				// Setup LLM client via proxy
+				baseURL := os.Getenv("DROVER_LLM_PROXY_URL")
+				if baseURL == "" {
+					baseURL = "http://localhost:8080"
+				}
 
-			fmt.Println("🤖 Analyzing specification with AI...")
+				llmClient := client.NewClient(client.Config{
+					BaseURL: baseURL,
+					APIKey:  apiKey,
+					Timeout: 5 * time.Minute,
+				})
+
+				// Check if proxy is available
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+
+				_, healthErr := llmClient.GetHealth(ctx)
+				if healthErr != nil {
+					fmt.Printf("⚠️  LLM proxy server not available at %s\n", baseURL)
+					fmt.Printf("   Error: %v\n\n", healthErr)
+					fmt.Println("💡 Options:")
+					fmt.Println("   1. Start the proxy server: drover proxy serve")
+					fmt.Println("   2. Use direct API: drover spec spec.md --direct-api")
+					fmt.Println()
+					return fmt.Errorf("LLM proxy server not available")
+				}
+
+				analyzer = spec.NewAnalyzer(llmClient, model)
+				fmt.Println("🤖 Analyzing specification with AI (via proxy)...")
+			}
 			fmt.Printf("   Model: %s\n", model)
 
 			// Analyze the spec
@@ -147,6 +181,7 @@ Examples:
 	command.Flags().BoolVar(&dryRun, "dry-run", false, "Preview changes without creating")
 	command.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
 	command.Flags().StringVar(&model, "model", "", "AI model to use (default: claude-sonnet-4-20250514)")
+	command.Flags().BoolVar(&directAPI, "direct-api", false, "Use Anthropic API directly instead of proxy")
 
 	return command
 }

@@ -2,11 +2,15 @@
 package spec
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	llmclient "github.com/cloud-shuttle/drover/internal/llmproxy/client"
 	"github.com/cloud-shuttle/drover/internal/llmproxy"
@@ -14,8 +18,10 @@ import (
 
 // Analyzer uses AI to break down specs into epics and tasks
 type Analyzer struct {
-	client *llmclient.Client
-	model  string
+	client  *llmclient.Client
+	model   string
+	apiKey  string
+	useDirectAPI bool
 }
 
 // NewAnalyzer creates a new spec analyzer
@@ -23,6 +29,16 @@ func NewAnalyzer(llmClient *llmclient.Client, model string) *Analyzer {
 	return &Analyzer{
 		client: llmClient,
 		model:  model,
+		useDirectAPI: false,
+	}
+}
+
+// NewAnalyzerWithDirectAPI creates a new spec analyzer that uses Anthropic API directly
+func NewAnalyzerWithDirectAPI(apiKey, model string) *Analyzer {
+	return &Analyzer{
+		apiKey: apiKey,
+		model:  model,
+		useDirectAPI: true,
 	}
 }
 
@@ -30,6 +46,41 @@ func NewAnalyzer(llmClient *llmclient.Client, model string) *Analyzer {
 func (a *Analyzer) AnalyzeSpec(ctx context.Context, content string) (*SpecAnalysis, error) {
 	prompt := a.buildPrompt(content)
 
+	var responseContent string
+	var err error
+
+	if a.useDirectAPI {
+		responseContent, err = a.callAnthropicDirect(ctx, prompt)
+	} else {
+		responseContent, err = a.callViaProxy(ctx, prompt)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract JSON from response
+	jsonStr, err := a.extractJSON(responseContent)
+	if err != nil {
+		return nil, fmt.Errorf("extracting JSON: %w", err)
+	}
+
+	// Parse the structured response
+	var analysis SpecAnalysis
+	if err := json.Unmarshal([]byte(jsonStr), &analysis); err != nil {
+		return nil, fmt.Errorf("parsing AI response: %w (raw JSON: %s)", err, jsonStr)
+	}
+
+	// Validate the analysis
+	if err := a.validateAnalysis(&analysis); err != nil {
+		return nil, fmt.Errorf("invalid analysis: %w", err)
+	}
+
+	return &analysis, nil
+}
+
+// callViaProxy calls the LLM through the proxy server
+func (a *Analyzer) callViaProxy(ctx context.Context, prompt string) (string, error) {
 	req := &llmproxy.ChatRequest{
 		Model: a.model,
 		Messages: []llmproxy.Message{
@@ -48,31 +99,85 @@ func (a *Analyzer) AnalyzeSpec(ctx context.Context, content string) (*SpecAnalys
 
 	resp, err := a.client.Chat(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("calling AI: %w", err)
+		return "", fmt.Errorf("calling AI via proxy: %w", err)
 	}
 
 	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("no response from AI")
+		return "", fmt.Errorf("no response from AI")
 	}
 
-	// Extract JSON from response
-	jsonStr, err := a.extractJSON(resp.Choices[0].Message.Content)
+	return resp.Choices[0].Message.Content, nil
+}
+
+// callAnthropicDirect calls the Anthropic API directly
+func (a *Analyzer) callAnthropicDirect(ctx context.Context, prompt string) (string, error) {
+	// Anthropic API request body
+	type AnthropicMessage struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+
+	type AnthropicRequest struct {
+		Model     string             `json:"model"`
+		MaxTokens int                `json:"max_tokens"`
+		Messages  []AnthropicMessage `json:"messages"`
+		System    string             `json:"system,omitempty"`
+	}
+
+	reqBody := AnthropicRequest{
+		Model:     a.model,
+		MaxTokens: 8000,
+		Messages: []AnthropicMessage{
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+		System: "You are an expert project manager and technical lead. You break down design specifications into actionable epics, stories, and tasks.",
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("extracting JSON: %w", err)
+		return "", fmt.Errorf("marshaling request: %w", err)
 	}
 
-	// Parse the structured response
-	var analysis SpecAnalysis
-	if err := json.Unmarshal([]byte(jsonStr), &analysis); err != nil {
-		return nil, fmt.Errorf("parsing AI response: %w (raw JSON: %s)", err, jsonStr)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(jsonBody))
+	if err != nil {
+		return "", fmt.Errorf("creating request: %w", err)
 	}
 
-	// Validate the analysis
-	if err := a.validateAnalysis(&analysis); err != nil {
-		return nil, fmt.Errorf("invalid analysis: %w", err)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", a.apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("calling Anthropic API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("Anthropic API error: status %d: %s", resp.StatusCode, string(body))
 	}
 
-	return &analysis, nil
+	var result struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decoding response: %w", err)
+	}
+
+	if len(result.Content) == 0 {
+		return "", fmt.Errorf("empty response from Anthropic API")
+	}
+
+	return result.Content[0].Text, nil
 }
 
 // buildPrompt creates the prompt for AI analysis
