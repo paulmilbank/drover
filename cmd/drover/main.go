@@ -60,6 +60,7 @@ handles failures gracefully, and guarantees progress through crashes and restart
 		resetCmd(),
 		exportCmd(),
 		importCmd(),
+		importJSONLCmd(),
 		shareCmd(),
 		importShareCmd(),
 		operatorCmd(),
