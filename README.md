@@ -99,6 +99,56 @@ go install github.com/cloud-shuttle/drover/cmd/drover@latest
 | `drover resume` | Resume interrupted workflows |
 | `drover worktree prune` | Clean up completed task worktrees |
 | `drover worktree prune -a` | Clean up all worktrees (incl. build artifacts) |
+| `drover import <file>` | Import tasks from a `.drover` export file |
+| `drover export [--format json]` | Export tasks to portable format |
+
+### Bulk Task Creation
+
+For importing multiple tasks at once, Drover provides several options:
+
+#### 1. JSONL Import Script
+
+Use `load-json.sh` to import epics, stories, and tasks from JSON Lines format:
+
+```bash
+./load-json.sh examples/gather-project.jsonl
+```
+
+JSONL format (one JSON object per line):
+```jsonl
+{"id": "EPIC-001", "type": "epic", "title": "Project Foundation", "description": "Set up infrastructure"}
+{"id": "STORY-001", "type": "story", "epic_id": "EPIC-001", "title": "Initialize Rust Workspace", "description": "Create workspace", "priority": 10}
+{"id": "TASK-001", "type": "task", "story_id": "STORY-001", "title": "Create cargo structure", "description": "Set up Cargo.toml", "priority": 5}
+```
+
+See `examples/gather-project.jsonl` for a complete example.
+
+#### 2. AI-Powered Task Generation
+
+Use `drover spec` to generate epics and tasks from design specifications:
+
+```bash
+# Generate from a spec file
+drover spec design/spec.md
+
+# Generate from a folder of design docs
+drover spec design/
+
+# Preview without creating
+drover spec spec.md --dry-run
+```
+
+#### 3. Session Import/Export
+
+Export and import complete Drover sessions:
+
+```bash
+# Export current session
+drover export session.jsonl
+
+# Import on another machine
+drover import session.jsonl
+```
 
 ## Configuration
 
