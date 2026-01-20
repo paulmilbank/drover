@@ -44,6 +44,15 @@ type Config struct {
 	WorkerBinary        string // path to drover-worker binary (default: "drover-worker")
 	WorkerMemoryLimit   string // memory limit for worker processes (e.g., "512M", "2G")
 
+	// Backpressure settings (adaptive concurrency control)
+	BackpressureEnabled           bool          // enable backpressure control
+	BackpressureInitialConcurrency int           // initial concurrency level
+	BackpressureMinConcurrency     int           // minimum concurrency
+	BackpressureMaxConcurrency     int           // maximum concurrency
+	BackpressureRateLimitBackoff   time.Duration // initial backoff on rate limit
+	BackpressureMaxBackoff         time.Duration // maximum backoff duration
+	BackpressureSlowThreshold      time.Duration // response time considered slow
+
 	// Worker mode settings (for planning/building separation)
 	WorkerMode    modes.WorkerMode // "combined", "planning", or "building"
 	RequireApproval bool             // require manual approval for plans
@@ -103,6 +112,13 @@ func Load() (*Config, error) {
 		UseWorkerSubprocess: false, // Process-isolated workers disabled by default
 		WorkerBinary:        "drover-worker",
 		WorkerMemoryLimit:   "",  // No memory limit by default
+		BackpressureEnabled: true, // Backpressure enabled by default
+		BackpressureInitialConcurrency: 2, // Start with 2 workers
+		BackpressureMinConcurrency:     1, // Minimum 1 worker
+		BackpressureMaxConcurrency:     4, // Maximum 4 workers
+		BackpressureRateLimitBackoff:   30 * time.Second, // Initial backoff
+		BackpressureMaxBackoff:         5 * time.Minute,  // Max backoff
+		BackpressureSlowThreshold:      10 * time.Second, // Slow threshold
 		WorkerMode:      modes.ModeCombined, // Default to combined mode
 		RequireApproval: false,    // Default to no approval required
 		Modes:           modes.DefaultConfig(), // Default modes configuration
@@ -159,6 +175,27 @@ func Load() (*Config, error) {
 	}
 	if v := os.Getenv("DROVER_WORKER_MODE"); v != "" {
 		cfg.WorkerMode = modes.WorkerMode(v)
+	}
+	if v := os.Getenv("DROVER_BACKPRESSURE_ENABLED"); v != "" {
+		cfg.BackpressureEnabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("DROVER_BACKPRESSURE_INITIAL_CONCURRENCY"); v != "" {
+		cfg.BackpressureInitialConcurrency = parseIntOrDefault(v, 2)
+	}
+	if v := os.Getenv("DROVER_BACKPRESSURE_MIN_CONCURRENCY"); v != "" {
+		cfg.BackpressureMinConcurrency = parseIntOrDefault(v, 1)
+	}
+	if v := os.Getenv("DROVER_BACKPRESSURE_MAX_CONCURRENCY"); v != "" {
+		cfg.BackpressureMaxConcurrency = parseIntOrDefault(v, 4)
+	}
+	if v := os.Getenv("DROVER_BACKPRESSURE_RATE_LIMIT_BACKOFF"); v != "" {
+		cfg.BackpressureRateLimitBackoff = parseDurationOrDefault(v, 30*time.Second)
+	}
+	if v := os.Getenv("DROVER_BACKPRESSURE_MAX_BACKOFF"); v != "" {
+		cfg.BackpressureMaxBackoff = parseDurationOrDefault(v, 5*time.Minute)
+	}
+	if v := os.Getenv("DROVER_BACKPRESSURE_SLOW_THRESHOLD"); v != "" {
+		cfg.BackpressureSlowThreshold = parseDurationOrDefault(v, 10*time.Second)
 	}
 	if v := os.Getenv("DROVER_REQUIRE_APPROVAL"); v != "" {
 		cfg.RequireApproval = v == "true" || v == "1"

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloud-shuttle/drover/internal/backpressure"
 	"github.com/cloud-shuttle/drover/pkg/types"
 )
 
@@ -123,7 +124,7 @@ func (e *Executor) runClaude(ctx context.Context, worktree, prompt string) (stri
 }
 
 // detectSignal analyzes output and duration to determine worker signal
-func (e *Executor) detectSignal(output string, duration time.Duration, execErr error) WorkerSignal {
+func (e *Executor) detectSignal(output string, duration time.Duration, execErr error) backpressure.WorkerSignal {
 	// Check for rate limit patterns
 	rateLimitPatterns := []string{
 		"pre-flight check is taking longer than expected",
@@ -135,21 +136,21 @@ func (e *Executor) detectSignal(output string, duration time.Duration, execErr e
 	lowerOutput := strings.ToLower(output)
 	for _, pattern := range rateLimitPatterns {
 		if strings.Contains(lowerOutput, strings.ToLower(pattern)) {
-			return SignalRateLimited
+			return backpressure.SignalRateLimited
 		}
 	}
 
 	// Check for slow response
 	if duration > SlowThreshold {
-		return SignalSlowResponse
+		return backpressure.SignalSlowResponse
 	}
 
 	// Check for API errors
 	if execErr != nil && strings.Contains(execErr.Error(), "context deadline exceeded") {
-		return SignalAPIError
+		return backpressure.SignalAPIError
 	}
 
-	return SignalOK
+	return backpressure.SignalOK
 }
 
 // determineVerdict analyzes output to determine task verdict

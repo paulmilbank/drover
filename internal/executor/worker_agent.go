@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloud-shuttle/drover/internal/backpressure"
 	ctxmngr "github.com/cloud-shuttle/drover/internal/context"
 	"github.com/cloud-shuttle/drover/pkg/types"
 	"go.opentelemetry.io/otel/trace"
@@ -174,6 +175,7 @@ func (a *WorkerAgent) ExecuteWithContext(ctx context.Context, worktreePath strin
 		Success:  result.Success,
 		Output:   result.Output,
 		Duration: duration,
+		Signal:   backpressure.WorkerSignal(result.Signal), // Populate signal from worker result
 	}
 
 	if !result.Success {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloud-shuttle/drover/internal/worker"
 	"github.com/cloud-shuttle/drover/pkg/telemetry"
 	"github.com/cloud-shuttle/drover/pkg/types"
 	"go.opentelemetry.io/otel/attribute"
@@ -23,6 +24,7 @@ type ExecutionResult struct {
 	Output   string
 	Error    error
 	Duration time.Duration
+	Signal   worker.WorkerSignal // Worker signal for backpressure control
 }
 
 // Executor runs tasks using Claude Code

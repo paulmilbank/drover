@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cloud-shuttle/drover/internal/analytics"
+	"github.com/cloud-shuttle/drover/internal/backpressure"
 	"github.com/cloud-shuttle/drover/internal/beads"
 	"github.com/cloud-shuttle/drover/internal/config"
 	ctxmngr "github.com/cloud-shuttle/drover/internal/context"
@@ -37,17 +38,18 @@ import (
 
 // Orchestrator manages the main execution loop
 type Orchestrator struct {
-	config   *config.Config
-	store    *db.Store
-	git      *git.WorktreeManager
-	pool     *git.WorktreePool // Worktree pool for pre-warming
-	agent    executor.Agent // Agent interface for Claude/Codex/Amp
-	workers  int
-	verbose  bool // Enable verbose logging
-	projectDir string // Project directory for beads sync
-	epicID   string // Optional epic filter for task execution
-	webhooks *webhooks.Manager // Webhook notification manager
-	analytics *analytics.Manager // Analytics manager
+	config        *config.Config
+	store         *db.Store
+	git           *git.WorktreeManager
+	pool          *git.WorktreePool // Worktree pool for pre-warming
+	agent         executor.Agent // Agent interface for Claude/Codex/Amp
+	workers       int
+	verbose       bool // Enable verbose logging
+	projectDir    string // Project directory for beads sync
+	epicID        string // Optional epic filter for task execution
+	webhooks      *webhooks.Manager // Webhook notification manager
+	analytics     *analytics.Manager // Analytics manager
+	backpressure  *backpressure.Controller // Backpressure controller for adaptive concurrency
 }
 
 // NewOrchestrator creates a new workflow orchestrator
@@ -137,6 +139,25 @@ func NewOrchestrator(cfg *config.Config, store *db.Store, projectDir string) (*O
 	// Create analytics manager (will be started in Run())
 	analyticsMgr, _ := cfg.CreateAnalyticsManager()
 
+	// Create backpressure controller if enabled
+	var backpressureCtrl *backpressure.Controller
+	if cfg.BackpressureEnabled {
+		backpressureCfg := backpressure.ControllerConfig{
+			InitialConcurrency: cfg.BackpressureInitialConcurrency,
+			MinConcurrency:     cfg.BackpressureMinConcurrency,
+			MaxConcurrency:     cfg.BackpressureMaxConcurrency,
+			RateLimitBackoff:   cfg.BackpressureRateLimitBackoff,
+			MaxBackoff:         cfg.BackpressureMaxBackoff,
+			SlowThreshold:      cfg.BackpressureSlowThreshold,
+			SlowCountThreshold: 3,
+		}
+		backpressureCtrl = backpressure.NewController(backpressureCfg)
+		if cfg.Verbose {
+			log.Printf("[backpressure] enabled with initial concurrency: %d, max: %d",
+				backpressureCfg.InitialConcurrency, backpressureCfg.MaxConcurrency)
+		}
+	}
+
 	// Check agent is installed
 	if err := agent.CheckInstalled(); err != nil {
 		if pool != nil {
@@ -146,16 +167,17 @@ func NewOrchestrator(cfg *config.Config, store *db.Store, projectDir string) (*O
 	}
 
 	return &Orchestrator{
-		config:     cfg,
-		store:      store,
-		git:        gitMgr,
-		pool:       pool,
-		agent:      agent,
-		workers:    cfg.Workers,
-		verbose:    cfg.Verbose,
-		projectDir: projectDir,
-		webhooks:   webhookMgr,
-		analytics:  analyticsMgr,
+		config:       cfg,
+		store:        store,
+		git:          gitMgr,
+		pool:         pool,
+		agent:        agent,
+		workers:      cfg.Workers,
+		verbose:      cfg.Verbose,
+		projectDir:   projectDir,
+		webhooks:     webhookMgr,
+		analytics:    analyticsMgr,
+		backpressure: backpressureCtrl,
 	}, nil
 }
 
@@ -267,6 +289,18 @@ func (o *Orchestrator) worker(ctx context.Context, id int, wg *sync.WaitGroup) {
 			}
 			return
 		default:
+			// Check backpressure controller before claiming
+			if o.backpressure != nil && !o.backpressure.CanSpawn() {
+				// In backoff period, wait and retry
+				stats := o.backpressure.GetStats()
+				if o.verbose {
+					log.Printf("[backpressure] worker %d waiting: backoff until %v (in-flight: %d/%d)",
+						id, stats.BackoffUntil.Format("15:04:05"), stats.CurrentInFlight, stats.MaxInFlight)
+				}
+				time.Sleep(time.Second)
+				continue
+			}
+
 			// Try to claim a task (filtered by epic if set)
 			workerID := fmt.Sprintf("worker-%d-%d", id, time.Now().UnixNano())
 			task, err := o.store.ClaimTaskForEpic(workerID, o.epicID)
@@ -282,6 +316,11 @@ func (o *Orchestrator) worker(ctx context.Context, id int, wg *sync.WaitGroup) {
 				continue
 			}
 
+			// Track worker started in backpressure controller
+			if o.backpressure != nil {
+				o.backpressure.WorkerStarted()
+			}
+
 			// Broadcast task claimed to dashboard
 			dashboard.BroadcastTaskClaimed(task.ID, task.Title, workerID)
 
@@ -292,6 +331,11 @@ func (o *Orchestrator) worker(ctx context.Context, id int, wg *sync.WaitGroup) {
 
 			// Execute the task
 			o.executeTask(id, task)
+
+			// Track worker finished in backpressure controller
+			if o.backpressure != nil {
+				o.backpressure.WorkerFinished()
+			}
 		}
 	}
 }
@@ -454,6 +498,12 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 
 	// Execute Claude Code and capture the result
 	result := o.agent.ExecuteWithContext(taskCtx, worktreePath, task, taskSpan)
+
+	// Report signal to backpressure controller
+	if o.backpressure != nil {
+		o.backpressure.OnWorkerSignal(result.Signal)
+	}
+
 	if !result.Success {
 		log.Printf("❌ Task %s failed: claude execution: %v", task.ID, result.Error)
 		telemetry.RecordError(taskSpan, result.Error, "AgentExecutionFailed", "agent")
@@ -636,6 +686,11 @@ func (o *Orchestrator) executeSubTasks(workerID int, parentTask *types.Task) boo
 		defer taskSpan.End()
 
 		result := o.agent.ExecuteWithContext(taskCtx, worktreePath, subTask, taskSpan)
+
+		// Report signal to backpressure controller
+		if o.backpressure != nil {
+			o.backpressure.OnWorkerSignal(result.Signal)
+		}
 
 		// Clean up worktree
 		if o.pool != nil && o.pool.IsEnabled() {

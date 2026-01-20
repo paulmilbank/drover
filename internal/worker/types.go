@@ -1,16 +1,21 @@
 // Package worker provides process-isolated task execution for Drover
 package worker
 
-import "time"
+import (
+	"time"
 
-// WorkerSignal indicates downstream health for backpressure control
-type WorkerSignal string
+	"github.com/cloud-shuttle/drover/internal/backpressure"
+)
 
+// WorkerSignal is an alias for backpressure.WorkerSignal
+type WorkerSignal = backpressure.WorkerSignal
+
+// Signal constants are re-exported from backpressure package
 const (
-	SignalOK          WorkerSignal = "ok"           // Normal execution
-	SignalRateLimited WorkerSignal = "rate_limited" // Rate limit detected
-	SignalSlowResponse WorkerSignal = "slow_response" // Slow response
-	SignalAPIError    WorkerSignal = "api_error"    // Transient API error
+	SignalOK          WorkerSignal = backpressure.SignalOK
+	SignalRateLimited WorkerSignal = backpressure.SignalRateLimited
+	SignalSlowResponse WorkerSignal = backpressure.SignalSlowResponse
+	SignalAPIError    WorkerSignal = backpressure.SignalAPIError
 )
 
 // TaskInput represents the input for a worker task execution
