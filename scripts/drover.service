@@ -1,0 +1,36 @@
+[Unit]
+Description=Drover Workflow Orchestrator
+Documentation=https://github.com/cloud-shuttle/drover
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/drover run
+WorkingDirectory=/root/drover
+Restart=always
+RestartSec=5
+
+# Memory limits to prevent OOM
+MemoryMax=2G
+MemoryHigh=1.5G
+
+# OOM handling
+OOMPolicy=continue
+OOMScoreAdjust=500
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Environment
+Environment=DROVER_BACKPRESSURE_ENABLED=true
+Environment=DROVER_BACKPRESSURE_INITIAL_CONCURRENCY=2
+Environment=DROVER_BACKPRESSURE_MAX_CONCURRENCY=4
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=drover
+
+[Install]
+WantedBy=multi-user.target

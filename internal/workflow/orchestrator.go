@@ -12,9 +12,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cloud-shuttle/drover/internal/analytics"
@@ -51,6 +53,8 @@ type Orchestrator struct {
 	webhooks      *webhooks.Manager // Webhook notification manager
 	analytics     *analytics.Manager // Analytics manager
 	backpressure  *backpressure.Controller // Backpressure controller for adaptive concurrency
+	shutdownCtx   context.Context // Context for shutdown signal
+	shutdownFunc  context.CancelFunc // Function to cancel shutdown context
 }
 
 // NewOrchestrator creates a new workflow orchestrator
@@ -167,7 +171,7 @@ func NewOrchestrator(cfg *config.Config, store *db.Store, projectDir string) (*O
 		return nil, fmt.Errorf("checking %s: %w", cfg.AgentType, err)
 	}
 
-	return &Orchestrator{
+	orch := &Orchestrator{
 		config:       cfg,
 		store:        store,
 		git:          gitMgr,
@@ -179,7 +183,27 @@ func NewOrchestrator(cfg *config.Config, store *db.Store, projectDir string) (*O
 		webhooks:     webhookMgr,
 		analytics:    analyticsMgr,
 		backpressure: backpressureCtrl,
-	}, nil
+	}
+
+	// Create shutdown context for graceful shutdown
+	orch.shutdownCtx, orch.shutdownFunc = context.WithCancel(context.Background())
+
+	// Setup signal handlers for graceful shutdown
+	orch.setupSignalHandlers()
+
+	return orch, nil
+}
+
+// setupSignalHandlers installs signal handlers for graceful shutdown
+func (o *Orchestrator) setupSignalHandlers() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal %v, initiating graceful shutdown...", sig)
+		o.shutdownFunc()
+	}()
 }
 
 // SetEpicFilter sets the epic filter for task execution
@@ -198,8 +222,23 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		log.Printf("🎯 Filtering to epic: %s", o.epicID)
 	}
 
+	// Merge context with shutdown context for graceful signal handling
+	// When either context is cancelled, the merged context is cancelled
+	mergedCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() {
+		select {
+		case <-mergedCtx.Done():
+			// Already cancelled, nothing to do
+		case <-o.shutdownCtx.Done():
+			// Shutdown context cancelled, cancel merged context
+			cancel()
+		}
+	}()
+
 	// Start workflow span for telemetry
-	_, workflowSpan := telemetry.StartWorkflowSpan(ctx, telemetry.SpanWorkflowRun, "")
+	_, workflowSpan := telemetry.StartWorkflowSpan(mergedCtx, telemetry.SpanWorkflowRun, "")
 	defer workflowSpan.End()
 
 	// Start webhook manager
@@ -236,7 +275,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for i := 0; i < o.workers; i++ {
 		wg.Add(1)
-		go o.worker(ctx, i, &wg)
+		go o.worker(mergedCtx, i, &wg)
 	}
 
 	// Main orchestration loop - just print progress and check for completion
