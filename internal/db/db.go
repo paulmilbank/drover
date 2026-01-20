@@ -2,6 +2,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloud-shuttle/drover/internal/conversation"
 	"github.com/cloud-shuttle/drover/pkg/types"
 	_ "github.com/glebarez/go-sqlite"
 )
@@ -636,6 +638,103 @@ func (s *Store) MigrateSchema() error {
 		`)
 		if err != nil {
 			return fmt.Errorf("adding test configuration columns: %w", err)
+		}
+	}
+
+	// Check if conversations table exists (drover-mem-8: Conversation Persistence with FTS5)
+	var conversationsTableExists bool
+	err = s.DB.QueryRow(`
+		SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='conversations'
+	`).Scan(&conversationsTableExists)
+	if err != nil {
+		return fmt.Errorf("checking for conversations table: %w", err)
+	}
+
+	if !conversationsTableExists {
+		// Create the conversations table for persisting Claude conversation history
+		_, err := s.DB.Exec(`
+			CREATE TABLE conversations (
+				id TEXT PRIMARY KEY,
+				task_id TEXT NOT NULL,
+				worktree TEXT,
+				status TEXT DEFAULT 'active',
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				turn_count INTEGER DEFAULT 0,
+				total_tokens INTEGER DEFAULT 0,
+				last_message_at INTEGER,
+				compression_type TEXT DEFAULT 'none',
+				FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+			);
+			CREATE INDEX IF NOT EXISTS idx_conversations_task_id ON conversations(task_id);
+			CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);
+			CREATE INDEX IF NOT EXISTS idx_conversations_last_message ON conversations(last_message_at);
+		`)
+		if err != nil {
+			return fmt.Errorf("creating conversations table: %w", err)
+		}
+
+		// Create conversation_turns table
+		_, err = s.DB.Exec(`
+			CREATE TABLE conversation_turns (
+				id TEXT PRIMARY KEY,
+				conversation_id TEXT NOT NULL,
+				turn_number INTEGER NOT NULL,
+				role TEXT NOT NULL,
+				content TEXT,
+				tool_use_id TEXT,
+				tool_name TEXT,
+				tool_input TEXT,
+				tool_result TEXT,
+				tokens_used INTEGER DEFAULT 0,
+				created_at INTEGER NOT NULL,
+				compressed INTEGER DEFAULT 0,
+				FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+			);
+			CREATE INDEX IF NOT EXISTS idx_conversation_turns_conv_id ON conversation_turns(conversation_id);
+			CREATE INDEX IF NOT EXISTS idx_conversation_turns_turn_number ON conversation_turns(conversation_id, turn_number);
+			CREATE INDEX IF NOT EXISTS idx_conversation_turns_role ON conversation_turns(role);
+			CREATE INDEX IF NOT EXISTS idx_conversation_turns_created ON conversation_turns(created_at);
+		`)
+		if err != nil {
+			return fmt.Errorf("creating conversation_turns table: %w", err)
+		}
+
+		// Create FTS5 virtual table for full-text search
+		_, err = s.DB.Exec(`
+			CREATE VIRTUAL TABLE conversation_turns_fts USING fts5(
+				content,
+				tool_name,
+				role,
+				content=conversation_turns,
+				content_rowid=rowid
+			);
+		`)
+		if err != nil {
+			return fmt.Errorf("creating conversation_turns_fts FTS5 table: %w", err)
+		}
+
+		// Populate FTS5 table with triggers for automatic sync
+		_, err = s.DB.Exec(`
+			-- Trigger to insert into FTS5 when a turn is created
+			CREATE TRIGGER IF NOT EXISTS conversation_turns_fts_insert AFTER INSERT ON conversation_turns BEGIN
+				INSERT INTO conversation_turns_fts(rowid, content, tool_name, role)
+				VALUES (new.rowid, new.content, new.tool_name, new.role);
+			END;
+
+			-- Trigger to update FTS5 when a turn is updated
+			CREATE TRIGGER IF NOT EXISTS conversation_turns_fts_update AFTER UPDATE ON conversation_turns BEGIN
+				UPDATE conversation_turns_fts SET content = new.content, tool_name = new.tool_name, role = new.role
+				WHERE rowid = new.rowid;
+			END;
+
+			-- Trigger to delete from FTS5 when a turn is deleted
+			CREATE TRIGGER IF NOT EXISTS conversation_turns_fts_delete AFTER DELETE ON conversation_turns BEGIN
+				DELETE FROM conversation_turns_fts WHERE rowid = old.rowid;
+			END;
+		`)
+		if err != nil {
+			return fmt.Errorf("creating FTS5 sync triggers: %w", err)
 		}
 	}
 
@@ -2995,4 +3094,604 @@ func (s *Store) FindOrphanedCheckpoints(heartbeatTimeout int64) ([]*types.TaskCh
 func (s *Store) DeleteCheckpoint(taskID string) error {
 	_, err := s.DB.Exec(`DELETE FROM task_checkpoints WHERE task_id = ?`, taskID)
 	return err
+}
+
+// ============================================================================
+// Conversation Methods (drover-mem-8: Conversation Persistence with FTS5)
+// ============================================================================
+
+// ConversationStore returns the conversation store for this database
+func (s *Store) ConversationStore() ConversationStore {
+	return &conversationStore{db: s}
+}
+
+// conversationStore implements conversation.Store using the db.Store
+type conversationStore struct {
+	db *Store
+}
+
+// CreateConversation creates a new conversation for a task
+func (cs *conversationStore) CreateConversation(ctx context.Context, taskID, worktree string) (*types.Conversation, error) {
+	id := generateID("conv")
+	now := time.Now().Unix()
+
+	conv := &types.Conversation{
+		ID:             id,
+		TaskID:         taskID,
+		Worktree:       worktree,
+		Status:         types.ConversationStatusActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		TurnCount:      0,
+		TotalTokens:    0,
+		CompressionType: "none",
+	}
+
+	_, err := cs.db.DB.ExecContext(ctx, `
+		INSERT INTO conversations (id, task_id, worktree, status, created_at, updated_at, turn_count, total_tokens, compression_type)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, conv.ID, conv.TaskID, conv.Worktree, conv.Status, conv.CreatedAt, conv.UpdatedAt, conv.TurnCount, conv.TotalTokens, conv.CompressionType)
+
+	if err != nil {
+		return nil, fmt.Errorf("creating conversation: %w", err)
+	}
+
+	return conv, nil
+}
+
+// GetConversation retrieves a conversation by ID
+func (cs *conversationStore) GetConversation(ctx context.Context, conversationID string) (*types.Conversation, error) {
+	var conv types.Conversation
+	err := cs.db.DB.QueryRowContext(ctx, `
+		SELECT id, task_id, worktree, status, created_at, updated_at, turn_count, total_tokens, last_message_at, compression_type
+		FROM conversations WHERE id = ?
+	`, conversationID).Scan(
+		&conv.ID, &conv.TaskID, &conv.Worktree, &conv.Status,
+		&conv.CreatedAt, &conv.UpdatedAt, &conv.TurnCount, &conv.TotalTokens,
+		&conv.LastMessageAt, &conv.CompressionType,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("conversation not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("getting conversation: %w", err)
+	}
+
+	return &conv, nil
+}
+
+// GetConversationByTask retrieves the active conversation for a task
+func (cs *conversationStore) GetConversationByTask(ctx context.Context, taskID string) (*types.Conversation, error) {
+	var conv types.Conversation
+	err := cs.db.DB.QueryRowContext(ctx, `
+		SELECT id, task_id, worktree, status, created_at, updated_at, turn_count, total_tokens, last_message_at, compression_type
+		FROM conversations WHERE task_id = ? AND status = 'active'
+		ORDER BY created_at DESC LIMIT 1
+	`, taskID).Scan(
+		&conv.ID, &conv.TaskID, &conv.Worktree, &conv.Status,
+		&conv.CreatedAt, &conv.UpdatedAt, &conv.TurnCount, &conv.TotalTokens,
+		&conv.LastMessageAt, &conv.CompressionType,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("conversation not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("getting conversation by task: %w", err)
+	}
+
+	return &conv, nil
+}
+
+// UpdateConversationStatus updates the status of a conversation
+func (cs *conversationStore) UpdateConversationStatus(ctx context.Context, conversationID string, status types.ConversationStatus) error {
+	now := time.Now().Unix()
+	_, err := cs.db.DB.ExecContext(ctx, `
+		UPDATE conversations SET status = ?, updated_at = ? WHERE id = ?
+	`, status, now, conversationID)
+
+	if err != nil {
+		return fmt.Errorf("updating conversation status: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteConversation deletes a conversation and all its turns
+func (cs *conversationStore) DeleteConversation(ctx context.Context, conversationID string) error {
+	_, err := cs.db.DB.ExecContext(ctx, `DELETE FROM conversations WHERE id = ?`, conversationID)
+	if err != nil {
+		return fmt.Errorf("deleting conversation: %w", err)
+	}
+	return nil
+}
+
+// AppendTurn adds a new turn to a conversation
+func (cs *conversationStore) AppendTurn(ctx context.Context, turn *types.ConversationTurn) error {
+	now := time.Now().Unix()
+	_, err := cs.db.DB.ExecContext(ctx, `
+		INSERT INTO conversation_turns (id, conversation_id, turn_number, role, content, tool_use_id, tool_name, tool_input, tool_result, tokens_used, created_at, compressed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, turn.ID, turn.ConversationID, turn.TurnNumber, turn.Role, turn.Content, turn.ToolUseID, turn.ToolName, turn.ToolInput, turn.ToolResult, turn.TokensUsed, now, 0)
+
+	if err != nil {
+		return fmt.Errorf("appending turn: %w", err)
+	}
+
+	// Update conversation metadata
+	_, err = cs.db.DB.ExecContext(ctx, `
+		UPDATE conversations
+		SET turn_count = turn_count + 1,
+		    total_tokens = total_tokens + ?,
+		    last_message_at = ?,
+		    updated_at = ?
+		WHERE id = ?
+	`, turn.TokensUsed, now, now, turn.ConversationID)
+
+	if err != nil {
+		return fmt.Errorf("updating conversation metadata: %w", err)
+	}
+
+	return nil
+}
+
+// GetTurn retrieves a specific turn by ID
+func (cs *conversationStore) GetTurn(ctx context.Context, turnID string) (*types.ConversationTurn, error) {
+	var turn types.ConversationTurn
+
+	err := cs.db.DB.QueryRowContext(ctx, `
+		SELECT id, conversation_id, turn_number, role, content, tool_use_id, tool_name, tool_input, tool_result, tokens_used, created_at, compressed
+		FROM conversation_turns WHERE id = ?
+	`, turnID).Scan(
+		&turn.ID, &turn.ConversationID, &turn.TurnNumber, &turn.Role, &turn.Content,
+		&turn.ToolUseID, &turn.ToolName, &turn.ToolInput, &turn.ToolResult,
+		&turn.TokensUsed, &turn.CreatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("turn not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("getting turn: %w", err)
+	}
+
+	return &turn, nil
+}
+
+// GetRecentTurns retrieves the N most recent turns from a conversation
+func (cs *conversationStore) GetRecentTurns(ctx context.Context, conversationID string, limit int) ([]*types.ConversationTurn, error) {
+	rows, err := cs.db.DB.QueryContext(ctx, `
+		SELECT id, conversation_id, turn_number, role, content, tool_use_id, tool_name, tool_input, tool_result, tokens_used, created_at
+		FROM conversation_turns
+		WHERE conversation_id = ?
+		ORDER BY turn_number DESC
+		LIMIT ?
+	`, conversationID, limit)
+
+	if err != nil {
+		return nil, fmt.Errorf("querying recent turns: %w", err)
+	}
+	defer rows.Close()
+
+	var turns []*types.ConversationTurn
+	for rows.Next() {
+		var turn types.ConversationTurn
+
+		err := rows.Scan(
+			&turn.ID, &turn.ConversationID, &turn.TurnNumber, &turn.Role, &turn.Content,
+			&turn.ToolUseID, &turn.ToolName, &turn.ToolInput, &turn.ToolResult,
+			&turn.TokensUsed, &turn.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning turn row: %w", err)
+		}
+
+		turns = append(turns, &turn)
+	}
+
+	// Reverse to get chronological order
+	for i, j := 0, len(turns)-1; i < j; i, j = i+1, j-1 {
+		turns[i], turns[j] = turns[j], turns[i]
+	}
+
+	return turns, nil
+}
+
+// GetTurnsByTokenBudget retrieves turns up to a token budget
+func (cs *conversationStore) GetTurnsByTokenBudget(ctx context.Context, conversationID string, maxTokens int) ([]*types.ConversationTurn, error) {
+	// Simple implementation: get all turns and filter by token count
+	rows, err := cs.db.DB.QueryContext(ctx, `
+		SELECT id, conversation_id, turn_number, role, content, tool_use_id, tool_name, tool_input, tool_result, tokens_used, created_at
+		FROM conversation_turns
+		WHERE conversation_id = ?
+		ORDER BY turn_number ASC
+	`, conversationID)
+
+	if err != nil {
+		return nil, fmt.Errorf("querying turns: %w", err)
+	}
+	defer rows.Close()
+
+	var turns []*types.ConversationTurn
+	totalTokens := 0
+
+	for rows.Next() {
+		var turn types.ConversationTurn
+
+		err := rows.Scan(
+			&turn.ID, &turn.ConversationID, &turn.TurnNumber, &turn.Role, &turn.Content,
+			&turn.ToolUseID, &turn.ToolName, &turn.ToolInput, &turn.ToolResult,
+			&turn.TokensUsed, &turn.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning turn row: %w", err)
+		}
+
+		tokens := turn.TokensUsed
+		if tokens == 0 {
+			// Estimate tokens: ~4 characters per token
+			tokens = len(turn.Content) / 4
+		}
+
+		if totalTokens+tokens > maxTokens && len(turns) > 0 {
+			break
+		}
+
+		turns = append(turns, &turn)
+		totalTokens += tokens
+	}
+
+	return turns, nil
+}
+
+// GetTurnsByRange retrieves turns in a specific range
+func (cs *conversationStore) GetTurnsByRange(ctx context.Context, conversationID string, start, end int) ([]*types.ConversationTurn, error) {
+	rows, err := cs.db.DB.QueryContext(ctx, `
+		SELECT id, conversation_id, turn_number, role, content, tool_use_id, tool_name, tool_input, tool_result, tokens_used, created_at
+		FROM conversation_turns
+		WHERE conversation_id = ? AND turn_number >= ? AND turn_number <= ?
+		ORDER BY turn_number ASC
+	`, conversationID, start, end)
+
+	if err != nil {
+		return nil, fmt.Errorf("querying turns by range: %w", err)
+	}
+	defer rows.Close()
+
+	var turns []*types.ConversationTurn
+	for rows.Next() {
+		var turn types.ConversationTurn
+
+		err := rows.Scan(
+			&turn.ID, &turn.ConversationID, &turn.TurnNumber, &turn.Role, &turn.Content,
+			&turn.ToolUseID, &turn.ToolName, &turn.ToolInput, &turn.ToolResult,
+			&turn.TokensUsed, &turn.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning turn row: %w", err)
+		}
+
+		turns = append(turns, &turn)
+	}
+
+	return turns, nil
+}
+
+// SearchTurns performs full-text search on conversation turns
+func (cs *conversationStore) SearchTurns(ctx context.Context, query string, limit int) ([]*types.ConversationSearchResult, error) {
+	// Use FTS5 search with BM25 ranking
+	rows, err := cs.db.DB.QueryContext(ctx, `
+		SELECT
+			ct.id,
+			ct.conversation_id,
+			ct.turn_number,
+			ct.role,
+			ct.content,
+			ct.tool_use_id,
+			ct.tool_name,
+			ct.tool_input,
+			ct.tool_result,
+			ct.tokens_used,
+			ct.created_at,
+			fts.rank
+		FROM conversation_turns_fts fts
+		INNER JOIN conversation_turns ct ON ct.rowid = fts.rowid
+		WHERE conversation_turns_fts MATCH ?
+		ORDER BY rank
+		LIMIT ?
+	`, sanitizeFTSQuery(query), limit)
+
+	if err != nil {
+		return nil, fmt.Errorf("searching turns: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*types.ConversationSearchResult
+	for rows.Next() {
+		var turn types.ConversationTurn
+		var rank float64
+
+		err := rows.Scan(
+			&turn.ID, &turn.ConversationID, &turn.TurnNumber, &turn.Role, &turn.Content,
+			&turn.ToolUseID, &turn.ToolName, &turn.ToolInput, &turn.ToolResult,
+			&turn.TokensUsed, &turn.CreatedAt, &rank,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning search result: %w", err)
+		}
+
+		results = append(results, &types.ConversationSearchResult{
+			Turn:       &turn,
+			Rank:       rank,
+			MatchCount: int(rank * 10),
+		})
+	}
+
+	return results, nil
+}
+
+// SearchTurnsInConversation searches within a specific conversation
+func (cs *conversationStore) SearchTurnsInConversation(ctx context.Context, conversationID, query string, limit int) ([]*types.ConversationSearchResult, error) {
+	rows, err := cs.db.DB.QueryContext(ctx, `
+		SELECT
+			ct.id,
+			ct.conversation_id,
+			ct.turn_number,
+			ct.role,
+			ct.content,
+			ct.tool_use_id,
+			ct.tool_name,
+			ct.tool_input,
+			ct.tool_result,
+			ct.tokens_used,
+			ct.created_at,
+			fts.rank
+		FROM conversation_turns_fts fts
+		INNER JOIN conversation_turns ct ON ct.rowid = fts.rowid
+		WHERE ct.conversation_id = ? AND conversation_turns_fts MATCH ?
+		ORDER BY rank
+		LIMIT ?
+	`, conversationID, sanitizeFTSQuery(query), limit)
+
+	if err != nil {
+		return nil, fmt.Errorf("searching turns in conversation: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*types.ConversationSearchResult
+	for rows.Next() {
+		var turn types.ConversationTurn
+		var rank float64
+
+		err := rows.Scan(
+			&turn.ID, &turn.ConversationID, &turn.TurnNumber, &turn.Role, &turn.Content,
+			&turn.ToolUseID, &turn.ToolName, &turn.ToolInput, &turn.ToolResult,
+			&turn.TokensUsed, &turn.CreatedAt, &rank,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning search result: %w", err)
+		}
+
+		results = append(results, &types.ConversationSearchResult{
+			Turn:       &turn,
+			Rank:       rank,
+			MatchCount: int(rank * 10),
+		})
+	}
+
+	return results, nil
+}
+
+// BuildContext loads conversation context for a task
+func (cs *conversationStore) BuildContext(ctx context.Context, taskID string, options *conversation.BuildContextOptions) (*types.ConversationContext, error) {
+	if options == nil {
+		options = &conversation.BuildContextOptions{
+			MaxTurns:      50,
+			MaxTokens:     100000,
+			IncludeSystem: true,
+			IncludeTools:  true,
+		}
+	}
+
+	// Get the active conversation
+	conv, err := cs.GetConversationByTask(ctx, taskID)
+	if err != nil {
+		// No conversation exists, return empty context
+		return &types.ConversationContext{
+			TaskID:      taskID,
+			Turns:       []*types.ConversationTurn{},
+			TotalTokens: 0,
+			TokenBudget: options.MaxTokens,
+			LoadedAt:    time.Now().Unix(),
+		}, nil
+	}
+
+	// Get turns based on options
+	var turns []*types.ConversationTurn
+
+	if options.MaxTokens > 0 {
+		turns, err = cs.GetTurnsByTokenBudget(ctx, conv.ID, options.MaxTokens)
+	} else {
+		turns, err = cs.GetRecentTurns(ctx, conv.ID, options.MaxTurns)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("loading turns: %w", err)
+	}
+
+	// Calculate total tokens
+	totalTokens := 0
+	for _, turn := range turns {
+		if turn.TokensUsed > 0 {
+			totalTokens += turn.TokensUsed
+		} else {
+			totalTokens += len(turn.Content) / 4
+		}
+	}
+
+	return &types.ConversationContext{
+		ConversationID: conv.ID,
+		TaskID:         taskID,
+		Turns:          turns,
+		TotalTokens:    totalTokens,
+		TokenBudget:    options.MaxTokens,
+		LoadedAt:       time.Now().Unix(),
+	}, nil
+}
+
+// ResumeConversation loads conversation context for resuming a task
+func (cs *conversationStore) ResumeConversation(ctx context.Context, taskID string) (*types.ConversationContext, error) {
+	options := &conversation.BuildContextOptions{
+		MaxTurns:      100,
+		MaxTokens:     200000,
+		IncludeSystem: true,
+		IncludeTools:  true,
+	}
+	return cs.BuildContext(ctx, taskID, options)
+}
+
+// GetStats returns statistics about a conversation
+func (cs *conversationStore) GetStats(ctx context.Context, conversationID string) (*types.ConversationStats, error) {
+	var stats types.ConversationStats
+
+	// Get basic counts
+	err := cs.db.DB.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*) as total_turns,
+			COALESCE(SUM(tokens_used), 0) as total_tokens
+		FROM conversation_turns WHERE conversation_id = ?
+	`, conversationID).Scan(&stats.TotalTurns, &stats.TotalTokens)
+
+	if err != nil {
+		return nil, fmt.Errorf("getting conversation stats: %w", err)
+	}
+
+	// Get role breakdown
+	rows, err := cs.db.DB.QueryContext(ctx, `
+		SELECT role, COUNT(*) as count
+		FROM conversation_turns
+		WHERE conversation_id = ?
+		GROUP BY role
+	`, conversationID)
+
+	if err != nil {
+		return nil, fmt.Errorf("getting role breakdown: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var role string
+		var count int
+		if err := rows.Scan(&role, &count); err != nil {
+			return nil, fmt.Errorf("scanning role count: %w", err)
+		}
+		switch types.ConversationRole(role) {
+		case types.ConversationRoleUser:
+			stats.UserTurns = count
+		case types.ConversationRoleAssistant:
+			stats.AssistantTurns = count
+		case types.ConversationRoleTool:
+			stats.ToolTurns = count
+		}
+	}
+
+	// Calculate average
+	if stats.TotalTurns > 0 {
+		stats.AvgTokensPerTurn = float64(stats.TotalTokens) / float64(stats.TotalTurns)
+	}
+
+	// Get duration
+	var createdAt, lastMessageAt int64
+	err = cs.db.DB.QueryRowContext(ctx, `
+		SELECT created_at, COALESCE(last_message_at, created_at)
+		FROM conversations WHERE id = ?
+	`, conversationID).Scan(&createdAt, &lastMessageAt)
+
+	if err != nil {
+		return nil, fmt.Errorf("getting conversation timestamps: %w", err)
+	}
+
+	stats.Duration = lastMessageAt - createdAt
+
+	return &stats, nil
+}
+
+// PruneConversation removes old turns from a conversation
+func (cs *conversationStore) PruneConversation(ctx context.Context, conversationID string, options *conversation.PruneOptions) (int, error) {
+	if options == nil {
+		options = &conversation.PruneOptions{}
+	}
+
+	query := `DELETE FROM conversation_turns WHERE conversation_id = ?`
+	args := []interface{}{conversationID}
+
+	if options.KeepLastN > 0 {
+		query = `
+			DELETE FROM conversation_turns
+			WHERE conversation_id = ? AND turn_number < (
+				SELECT COALESCE(MAX(turn_number) - ?, 0) FROM conversation_turns WHERE conversation_id = ?
+			)
+		`
+		args = []interface{}{conversationID, options.KeepLastN, conversationID}
+	}
+
+	result, err := cs.db.DB.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("pruning conversation: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	return int(rowsAffected), nil
+}
+
+// ArchiveConversation moves a completed conversation to archive
+func (cs *conversationStore) ArchiveConversation(ctx context.Context, conversationID string) error {
+	_, err := cs.db.DB.ExecContext(ctx, `
+		UPDATE conversations SET status = 'archived', updated_at = ? WHERE id = ?
+	`, time.Now().Unix(), conversationID)
+
+	if err != nil {
+		return fmt.Errorf("archiving conversation: %w", err)
+	}
+
+	return nil
+}
+
+// ConversationStore interface for db.Store
+type ConversationStore interface {
+	CreateConversation(ctx context.Context, taskID, worktree string) (*types.Conversation, error)
+	GetConversation(ctx context.Context, conversationID string) (*types.Conversation, error)
+	GetConversationByTask(ctx context.Context, taskID string) (*types.Conversation, error)
+	UpdateConversationStatus(ctx context.Context, conversationID string, status types.ConversationStatus) error
+	DeleteConversation(ctx context.Context, conversationID string) error
+	AppendTurn(ctx context.Context, turn *types.ConversationTurn) error
+	GetRecentTurns(ctx context.Context, conversationID string, limit int) ([]*types.ConversationTurn, error)
+	GetTurnsByTokenBudget(ctx context.Context, conversationID string, maxTokens int) ([]*types.ConversationTurn, error)
+	GetTurnsByRange(ctx context.Context, conversationID string, start, end int) ([]*types.ConversationTurn, error)
+	SearchTurns(ctx context.Context, query string, limit int) ([]*types.ConversationSearchResult, error)
+	SearchTurnsInConversation(ctx context.Context, conversationID, query string, limit int) ([]*types.ConversationSearchResult, error)
+	BuildContext(ctx context.Context, taskID string, options *conversation.BuildContextOptions) (*types.ConversationContext, error)
+	ResumeConversation(ctx context.Context, taskID string) (*types.ConversationContext, error)
+	GetStats(ctx context.Context, conversationID string) (*types.ConversationStats, error)
+	PruneConversation(ctx context.Context, conversationID string, options *conversation.PruneOptions) (int, error)
+	ArchiveConversation(ctx context.Context, conversationID string) error
+}
+
+// sanitizeFTSQuery sanitizes FTS5 query to prevent injection
+func sanitizeFTSQuery(query string) string {
+	// Remove special characters that could break FTS5
+	safe := strings.Builder{}
+	for _, r := range query {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == ' ', r == '"', r == '*', r == '(', r == ')', r == '-', r == '+':
+			safe.WriteRune(r)
+		default:
+			// Skip unsafe characters
+		}
+	}
+	return safe.String()
 }
