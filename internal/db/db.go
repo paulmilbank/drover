@@ -288,6 +288,18 @@ func (s *Store) InitSchema() error {
 		FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 	);
 
+	-- Task checkpoints for crash recovery
+	CREATE TABLE IF NOT EXISTS task_checkpoints (
+		task_id TEXT PRIMARY KEY,
+		state TEXT NOT NULL,
+		worker_pid INTEGER,
+		started_at INTEGER NOT NULL,
+		last_heartbeat INTEGER NOT NULL,
+		attempt INTEGER NOT NULL DEFAULT 0,
+		output TEXT,
+		FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+	);
+
 	-- Operators for multiplayer collaboration
 	CREATE TABLE IF NOT EXISTS operators (
 		id TEXT PRIMARY KEY,
@@ -308,6 +320,8 @@ func (s *Store) InitSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_worktrees_created ON worktrees(created_at);
 	CREATE INDEX IF NOT EXISTS idx_guidance_task ON guidance_queue(task_id);
 	CREATE INDEX IF NOT EXISTS idx_guidance_delivered ON guidance_queue(delivered);
+	CREATE INDEX IF NOT EXISTS idx_checkpoints_state ON task_checkpoints(state);
+	CREATE INDEX IF NOT EXISTS idx_checkpoints_last_heartbeat ON task_checkpoints(last_heartbeat);
 	CREATE INDEX IF NOT EXISTS idx_operators_name ON operators(name);
 	CREATE INDEX IF NOT EXISTS idx_operators_api_key ON operators(api_key);
 	`
@@ -2843,4 +2857,142 @@ func jsonMarshal(v interface{}) (string, error) {
 // jsonUnmarshal unmarshals JSON to a value
 func jsonUnmarshal(s string, v interface{}) error {
 	return json.Unmarshal([]byte(s), v)
+}
+
+// Checkpoint operations for crash recovery
+
+// CreateCheckpoint creates a new checkpoint for a task
+func (s *Store) CreateCheckpoint(checkpoint *types.TaskCheckpoint) error {
+	query := `
+		INSERT INTO task_checkpoints (task_id, state, worker_pid, started_at, last_heartbeat, attempt, output)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(task_id) DO UPDATE SET
+			state = excluded.state,
+			worker_pid = excluded.worker_pid,
+			started_at = excluded.started_at,
+			last_heartbeat = excluded.last_heartbeat,
+			attempt = excluded.attempt,
+			output = excluded.output
+	`
+	_, err := s.DB.Exec(query,
+		checkpoint.TaskID,
+		string(checkpoint.State),
+		checkpoint.WorkerPID,
+		checkpoint.StartedAt,
+		checkpoint.LastHeartbeat,
+		checkpoint.Attempt,
+		checkpoint.Output,
+	)
+	return err
+}
+
+// UpdateCheckpoint updates a task's checkpoint (typically heartbeat or output)
+func (s *Store) UpdateCheckpoint(taskID string, output string, heartbeat int64) error {
+	query := `
+		UPDATE task_checkpoints
+		SET last_heartbeat = ?, output = COALESCE(?, output)
+		WHERE task_id = ?
+	`
+	result, err := s.DB.Exec(query, heartbeat, output, taskID)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("checkpoint not found for task: %s", taskID)
+	}
+	return nil
+}
+
+// CompleteCheckpoint marks a task checkpoint as completed
+func (s *Store) CompleteCheckpoint(taskID string, verdict types.TaskVerdict, reason string) error {
+	state := types.TaskStatusCompleted
+	if verdict != types.TaskVerdictPass {
+		state = types.TaskStatusFailed
+	}
+
+	query := `
+		UPDATE task_checkpoints
+		SET state = ?
+		WHERE task_id = ?
+	`
+	result, err := s.DB.Exec(query, string(state), taskID)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("checkpoint not found for task: %s", taskID)
+	}
+	return nil
+}
+
+// GetCheckpoint retrieves a task's checkpoint
+func (s *Store) GetCheckpoint(taskID string) (*types.TaskCheckpoint, error) {
+	query := `
+		SELECT task_id, state, worker_pid, started_at, last_heartbeat, attempt, output
+		FROM task_checkpoints
+		WHERE task_id = ?
+	`
+	var checkpoint types.TaskCheckpoint
+	var stateStr string
+	err := s.DB.QueryRow(query, taskID).Scan(
+		&checkpoint.TaskID,
+		&stateStr,
+		&checkpoint.WorkerPID,
+		&checkpoint.StartedAt,
+		&checkpoint.LastHeartbeat,
+		&checkpoint.Attempt,
+		&checkpoint.Output,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	checkpoint.State = types.TaskStatus(stateStr)
+	return &checkpoint, nil
+}
+
+// FindOrphanedCheckpoints finds checkpoints that are in Running state but the worker is no longer alive
+func (s *Store) FindOrphanedCheckpoints(heartbeatTimeout int64) ([]*types.TaskCheckpoint, error) {
+	query := `
+		SELECT task_id, state, worker_pid, started_at, last_heartbeat, attempt, output
+		FROM task_checkpoints
+		WHERE state = ? AND last_heartbeat < ?
+	`
+	cutoff := time.Now().Unix() - heartbeatTimeout
+	rows, err := s.DB.Query(query, string(types.TaskStatusInProgress), cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var checkpoints []*types.TaskCheckpoint
+	for rows.Next() {
+		var checkpoint types.TaskCheckpoint
+		var stateStr string
+		err := rows.Scan(
+			&checkpoint.TaskID,
+			&stateStr,
+			&checkpoint.WorkerPID,
+			&checkpoint.StartedAt,
+			&checkpoint.LastHeartbeat,
+			&checkpoint.Attempt,
+			&checkpoint.Output,
+		)
+		if err != nil {
+			return nil, err
+		}
+		checkpoint.State = types.TaskStatus(stateStr)
+		checkpoints = append(checkpoints, &checkpoint)
+	}
+	return checkpoints, nil
+}
+
+// DeleteCheckpoint removes a task's checkpoint
+func (s *Store) DeleteCheckpoint(taskID string) error {
+	_, err := s.DB.Exec(`DELETE FROM task_checkpoints WHERE task_id = ?`, taskID)
+	return err
 }

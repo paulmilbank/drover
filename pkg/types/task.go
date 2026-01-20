@@ -105,6 +105,17 @@ type TaskExecutionContext struct {
 	WorktreePath string           `json:"worktree_path,omitempty"` // Path to the worktree
 }
 
+// TaskCheckpoint represents the execution state of a task for crash recovery
+type TaskCheckpoint struct {
+	TaskID       string    `json:"task_id"`
+	State        TaskStatus `json:"state"`
+	WorkerPID    int       `json:"worker_pid"`
+	StartedAt    int64     `json:"started_at"`
+	LastHeartbeat int64     `json:"last_heartbeat"`
+	Attempt      int       `json:"attempt"`
+	Output       string    `json:"output,omitempty"`
+}
+
 // ProjectStatus summarizes the current state of all tasks
 type ProjectStatus struct {
 	Total      int             `json:"total"`

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -221,6 +222,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		}()
 	}
 
+	// Recover orphaned tasks from previous crashes
+	if err := o.recoverOrphanedTasks(); err != nil {
+		log.Printf("[recovery] warning: failed to recover orphaned tasks: %v", err)
+	}
+
 	// Ensure pool is stopped when we exit
 	if o.pool != nil {
 		defer o.pool.Stop()
@@ -371,6 +377,29 @@ func (o *Orchestrator) executeTask(workerID int, task *types.Task) {
 	workerIDStr := fmt.Sprintf("worker-%d", workerID)
 	telemetry.RecordTaskClaimed(taskCtx, workerIDStr, o.epicID)
 	defer taskSpan.End()
+
+	// Create checkpoint for crash recovery
+	checkpoint := &types.TaskCheckpoint{
+		TaskID:        task.ID,
+		State:         types.TaskStatusInProgress,
+		WorkerPID:     os.Getpid(),
+		StartedAt:     time.Now().Unix(),
+		LastHeartbeat: time.Now().Unix(),
+		Attempt:       task.Attempts + 1,
+	}
+	if err := o.store.CreateCheckpoint(checkpoint); err != nil {
+		log.Printf("[checkpoint] warning: failed to create checkpoint for %s: %v", task.ID, err)
+	}
+	defer func() {
+		// Complete/cleanup checkpoint when done
+		if taskCompleted {
+			verdict := types.TaskVerdictPass
+			if task.Status != types.TaskStatusCompleted {
+				verdict = types.TaskVerdictFail
+			}
+			_ = o.store.CompleteCheckpoint(task.ID, verdict, task.VerdictReason)
+		}
+	}()
 
 	// Update to in_progress
 	if err := o.store.UpdateTaskStatus(task.ID, types.TaskStatusInProgress, ""); err != nil {
@@ -1000,4 +1029,63 @@ func (o *Orchestrator) getProjectTaskContextMaxAge() time.Duration {
 	}
 	// Return default if no project config
 	return 24 * time.Hour
+}
+
+// recoverOrphanedTasks finds and recovers tasks that were in progress but crashed
+func (o *Orchestrator) recoverOrphanedTasks() error {
+	// Default orphan timeout: 2 minutes
+	orphanTimeout := int64(120)
+	if o.config.StallTimeout > 0 {
+		orphanTimeout = int64(o.config.StallTimeout.Seconds())
+	}
+
+	// Find orphaned checkpoints
+	orphaned, err := o.store.FindOrphanedCheckpoints(orphanTimeout)
+	if err != nil {
+		return fmt.Errorf("finding orphaned checkpoints: %w", err)
+	}
+
+	if len(orphaned) == 0 {
+		if o.verbose {
+			log.Printf("[recovery] no orphaned tasks found")
+		}
+		return nil
+	}
+
+	log.Printf("[recovery] found %d orphaned task(s)", len(orphaned))
+
+	for _, checkpoint := range orphaned {
+		// Check if we should requeue the task
+		task, err := o.store.GetTask(checkpoint.TaskID)
+		if err != nil {
+			log.Printf("[recovery] warning: failed to get task %s: %v", checkpoint.TaskID, err)
+			continue
+		}
+
+		if task == nil {
+			log.Printf("[recovery] warning: task %s no longer exists", checkpoint.TaskID)
+			_ = o.store.DeleteCheckpoint(checkpoint.TaskID)
+			continue
+		}
+
+		// Check retry limit
+		if checkpoint.Attempt >= task.MaxAttempts {
+			log.Printf("[recovery] task %s exceeded max attempts (%d), marking as failed",
+				checkpoint.TaskID, task.MaxAttempts)
+			_ = o.store.UpdateTaskStatus(checkpoint.TaskID, types.TaskStatusFailed,
+				fmt.Sprintf("Max retries exceeded (%d attempts)", checkpoint.Attempt))
+			_ = o.store.DeleteCheckpoint(checkpoint.TaskID)
+			continue
+		}
+
+		// Requeue the task for retry
+		log.Printf("[recovery] requeueing task %s (attempt %d/%d)",
+			checkpoint.TaskID, checkpoint.Attempt+1, task.MaxAttempts)
+		_ = o.store.UpdateTaskStatus(checkpoint.TaskID, types.TaskStatusReady,
+			fmt.Sprintf("Recovering from crash (attempt %d)", checkpoint.Attempt))
+		_ = o.store.DeleteCheckpoint(checkpoint.TaskID)
+	}
+
+	log.Printf("[recovery] recovered %d task(s)", len(orphaned))
+	return nil
 }
